@@ -93,6 +93,12 @@ RasterizeGaussiansCUDA(
 		M = sh.size(1);
       }
 
+	  const float* sh_ptr = sh.numel() > 0 ? sh.contiguous().data_ptr<float>() : nullptr;
+	  const float* colors_ptr = colors.numel() > 0 ? colors.contiguous().data_ptr<float>() : nullptr;
+	  const float* scales_ptr = scales.numel() > 0 ? scales.contiguous().data_ptr<float>() : nullptr;
+	  const float* rotations_ptr = rotations.numel() > 0 ? rotations.contiguous().data_ptr<float>() : nullptr;
+	  const float* cov3D_precomp_ptr = cov3D_precomp.numel() > 0 ? cov3D_precomp.contiguous().data_ptr<float>() : nullptr;
+
 	  rendered = CudaRasterizer::Rasterizer::forward(
 	    geomFunc,
 		binningFunc,
@@ -101,13 +107,13 @@ RasterizeGaussiansCUDA(
 		background.contiguous().data<float>(),
 		W, H,
 		means3D.contiguous().data<float>(),
-		sh.contiguous().data_ptr<float>(),
-		colors.contiguous().data<float>(), 
+		sh_ptr,
+		colors_ptr,
 		opacity.contiguous().data<float>(), 
-		scales.contiguous().data_ptr<float>(),
+		scales_ptr,
 		scale_modifier,
-		rotations.contiguous().data_ptr<float>(),
-		cov3D_precomp.contiguous().data<float>(), 
+		rotations_ptr,
+		cov3D_precomp_ptr,
 		viewmatrix.contiguous().data<float>(), 
 		projmatrix.contiguous().data<float>(),
 		campos.contiguous().data<float>(),
@@ -239,6 +245,146 @@ torch::Tensor markVisible(
 		projmatrix.contiguous().data<float>(),
 		present.contiguous().data<bool>());
   }
-  
+   
   return present;
+}
+
+// True batch kernel version: single forward call for N cameras using batch kernels
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+RasterizeGaussiansBatchKernelCUDA(
+	const torch::Tensor& background,
+	const torch::Tensor& means3D,
+    const torch::Tensor& colors,
+    const torch::Tensor& opacity,
+	const torch::Tensor& scales,
+	const torch::Tensor& rotations,
+	const float scale_modifier,
+	const torch::Tensor& cov3D_precomp,
+	const torch::Tensor& viewmatrix,
+	const torch::Tensor& projmatrix,
+	const float tan_fovx, 
+	const float tan_fovy,
+    const int image_height,
+    const int image_width,
+	const torch::Tensor& sh,
+	const int degree,
+	const torch::Tensor& campos,
+	const bool prefiltered,
+	const bool antialiasing,
+	const bool debug)
+{
+  if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
+    AT_ERROR("means3D must have dimensions (num_points, 3)");
+  }
+  
+  // Check batch dimensions
+  const int N = viewmatrix.size(0);  // number of cameras
+  const int P = means3D.size(0);
+  const int H = image_height;
+  const int W = image_width;
+
+  // Validate batch tensor shapes
+  if (viewmatrix.size(1) != 4 || viewmatrix.size(2) != 4) {
+    AT_ERROR("viewmatrix must have shape (N, 4, 4)");
+  }
+  if (projmatrix.size(1) != 4 || projmatrix.size(2) != 4) {
+    AT_ERROR("projmatrix must have shape (N, 4, 4)");
+  }
+  if (campos.size(0) != N || campos.size(1) != 3) {
+    AT_ERROR("campos must have shape (N, 3)");
+  }
+
+  auto int_opts = means3D.options().dtype(torch::kInt32);
+  auto float_opts = means3D.options().dtype(torch::kFloat32);
+
+  // Output tensors: (N, 3, H, W), (N, 1, H, W), (N, P)
+  torch::Tensor out_color = torch::full({N, NUM_CHANNELS, H, W}, 0.0, float_opts);
+  torch::Tensor out_invdepth = torch::full({N, 1, H, W}, 0.0, float_opts);
+  torch::Tensor radii = torch::full({N, P}, 0, int_opts);
+
+  // Dummy buffers for backward compatibility (forward-only)
+  torch::Device device(torch::kCUDA);
+  torch::TensorOptions options(torch::kByte);
+  torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
+  torch::Tensor binningBuffer = torch::empty({0}, options.device(device));
+  torch::Tensor imgBuffer = torch::empty({0}, options.device(device));
+
+  // Ensure input tensors are contiguous
+  auto viewmatrix_c = viewmatrix.contiguous();
+  auto projmatrix_c = projmatrix.contiguous();
+  auto campos_c = campos.contiguous();
+  auto means3D_c = means3D.contiguous();
+  auto sh_c = sh.contiguous();
+  auto colors_c = colors.contiguous();
+  auto opacity_c = opacity.contiguous();
+  auto scales_c = scales.contiguous();
+  auto rotations_c = rotations.contiguous();
+  auto cov3D_precomp_c = cov3D_precomp.contiguous();
+  auto background_c = background.contiguous();
+
+  const float* viewmatrix_ptr = viewmatrix_c.data_ptr<float>();
+  const float* projmatrix_ptr = projmatrix_c.data_ptr<float>();
+  const float* campos_ptr = campos_c.data_ptr<float>();
+  
+  const float* means3D_ptr = means3D_c.data_ptr<float>();
+  const float* sh_ptr = sh_c.numel() > 0 ? sh_c.data_ptr<float>() : nullptr;
+  const float* colors_ptr = colors_c.numel() > 0 ? colors_c.data_ptr<float>() : nullptr;
+  const float* opacity_ptr = opacity_c.data_ptr<float>();
+  const float* scales_ptr = scales_c.numel() > 0 ? scales_c.data_ptr<float>() : nullptr;
+  const float* rotations_ptr = rotations_c.numel() > 0 ? rotations_c.data_ptr<float>() : nullptr;
+  const float* cov3D_precomp_ptr = cov3D_precomp_c.numel() > 0 ? cov3D_precomp_c.data_ptr<float>() : nullptr;
+  const float* bg_ptr = background_c.data_ptr<float>();
+
+  float* color_ptr = out_color.data_ptr<float>();
+  float* depth_ptr = out_invdepth.data_ptr<float>();
+  int* radii_ptr = radii.data_ptr<int>();
+
+  int M = 0;
+  if (sh.size(0) != 0) {
+    M = sh.size(1);
+  }
+
+  // Call the batch forward kernel
+  std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
+  std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
+  std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
+
+  int rendered = 0;
+  if (P != 0) {
+    rendered = CudaRasterizer::Rasterizer::forwardBatch(
+      geomFunc,
+      binningFunc,
+      imgFunc,
+      P, degree, M,
+      N,
+      bg_ptr,
+      W, H,
+      means3D_ptr,
+      sh_ptr,
+      colors_ptr,
+      opacity_ptr,
+      scales_ptr,
+      scale_modifier,
+      rotations_ptr,
+      cov3D_precomp_ptr,
+      viewmatrix_ptr,
+      projmatrix_ptr,
+      campos_ptr,
+      tan_fovx,
+      tan_fovy,
+      prefiltered,
+      color_ptr,
+      depth_ptr,
+      antialiasing,
+      radii_ptr,
+      debug);
+  }
+
+  // Debug: strict error checking for forwardBatch
+  auto err = cudaGetLastError();
+  if (err != cudaSuccess) AT_ERROR("forwardBatch launch failed: ", cudaGetErrorString(err));
+  err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) AT_ERROR("forwardBatch sync failed: ", cudaGetErrorString(err));
+
+  return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_invdepth);
 }

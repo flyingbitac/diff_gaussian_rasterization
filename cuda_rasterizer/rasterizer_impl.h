@@ -64,11 +64,50 @@ namespace CudaRasterizer
 		static BinningState fromChunk(char*& chunk, size_t P);
 	};
 
-	template<typename T> 
-	size_t required(size_t P)
+	// Batch versions for multi-camera rendering
+	struct GeometryStateBatch
+	{
+		size_t scan_size;
+		float* depths;           // (N, P)
+		char* scanning_space;
+		bool* clamped;           // (N, P, 3)
+		int* internal_radii;     // (N, P)
+		float2* means2D;         // (N, P)
+		float* cov3D;            // (N, P, 6)
+		float4* conic_opacity;   // (N, P)
+		float* rgb;              // (P, 3) - shared (view-independent)
+		uint32_t* point_offsets; // (N, P)
+		uint32_t* tiles_touched; // (N, P)
+
+		static GeometryStateBatch fromChunk(char*& chunk, size_t P, size_t N);
+	};
+
+	struct ImageStateBatch
+	{
+		uint2* ranges;           // (N, tile_count)
+		uint32_t* n_contrib;     // (N, H*W)
+		float* accum_alpha;      // (N, H*W)
+
+		static ImageStateBatch fromChunk(char*& chunk, size_t N, size_t tile_count, size_t num_pixels);
+	};
+
+	struct BinningStateBatch
+	{
+		size_t sorting_size;
+		uint64_t* point_list_keys_unsorted; // (max_rendered)
+		uint64_t* point_list_keys;
+		uint32_t* point_list_unsorted;
+		uint32_t* point_list;
+		char* list_sorting_space;
+
+		static BinningStateBatch fromChunk(char*& chunk, size_t max_rendered);
+	};
+
+	template<typename T, typename... Args>
+	size_t required(Args... args)
 	{
 		char* size = nullptr;
-		T::fromChunk(size, P);
+		T::fromChunk(size, args...);
 		return ((size_t)size) + 128;
 	}
 };

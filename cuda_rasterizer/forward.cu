@@ -147,6 +147,11 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 	cov3D[5] = Sigma[2][2];
 }
 
+__device__ __forceinline__ bool isProbeGaussian(int id)
+{
+	return id == 0 || id == 1 || id == 2 || id == 1024 || id == 65536 || id == 262144 || id == 524288 || id == 1048576 || id == 1500000 || id == 1999999;
+}
+
 // Perform initial steps for each Gaussian prior to rasterization.
 template<int C>
 __global__ void preprocessCUDA(int P, int D, int M,
@@ -173,6 +178,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float4* conic_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
+	int probe_debug,
 	bool prefiltered,
 	bool antialiasing)
 {
@@ -187,7 +193,10 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// Perform near culling, quit if outside.
 	float3 p_view;
-	if (!in_frustum(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view))
+	bool in_view = in_frustum(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view);
+	if (probe_debug && isProbeGaussian(idx))
+		printf("[PPROBE][SER] gid=%d in=%d pview=(%f,%f,%f)\n", (int)idx, (int)in_view, (double)p_view.x, (double)p_view.y, (double)p_view.z);
+	if (!in_view)
 		return;
 
 	// Transform point by projecting
@@ -266,6 +275,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
+	if (probe_debug && isProbeGaussian(idx))
+		printf("[PPROBE][SER] gid=%d radius=%d tiles=%u det=%f cov=(%f,%f,%f)\n", (int)idx, (int)my_radius, (unsigned)tiles_touched[idx], (double)det, (double)cov.x, (double)cov.y, (double)cov.z);
 }
 
 // Main rasterization method. Collaboratively works on one tile per
@@ -450,6 +461,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	float4* conic_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
+	int probe_debug,
 	bool prefiltered,
 	bool antialiasing)
 {
@@ -478,7 +490,305 @@ void FORWARD::preprocess(int P, int D, int M,
 		conic_opacity,
 		grid,
 		tiles_touched,
+		probe_debug,
 		prefiltered,
 		antialiasing
 		);
+}
+
+template<int C>
+__global__ void preprocessCUDABatch(int P, int D, int M, int N,
+	const float* orig_points,
+	const glm::vec3* scales,
+	const float scale_modifier,
+	const glm::vec4* rotations,
+	const float* opacities,
+	const float* shs,
+	bool* clamped,
+	const float* cov3D_precomp,
+	const float* colors_precomp,
+	const float* viewmatrixs,
+	const float* projmatrixs,
+	const glm::vec3* cam_poss,
+	const int W, int H,
+	const float tan_fovx, float tan_fovy,
+	const float focal_x, float focal_y,
+	int* radii,
+	float2* points_xy_image,
+	float* depths,
+	float* cov3Ds,
+	float* rgb,
+	float4* conic_opacity,
+	const dim3 grid,
+	uint32_t* tiles_touched,
+	int probe_debug,
+	bool prefiltered,
+	bool antialiasing)
+{
+	auto idx = cg::this_grid().thread_rank();
+	int total = P * N;
+	if (idx >= total) return;
+
+	int cam_id = idx / P;
+	int gaussian_id = idx % P;
+
+	radii[idx] = 0;
+	tiles_touched[idx] = 0;
+
+	const float* viewmatrix = viewmatrixs + cam_id * 16;
+	const float* projmatrix = projmatrixs + cam_id * 16;
+	const glm::vec3 cam_pos = cam_poss[cam_id];
+
+	float3 p_view;
+	bool in_view = in_frustum(gaussian_id, orig_points, viewmatrix, projmatrix, prefiltered, p_view);
+	if (probe_debug && cam_id == 0 && isProbeGaussian(gaussian_id))
+		printf("[PPROBE][BAT] gid=%d in=%d pview=(%f,%f,%f)\n", (int)gaussian_id, (int)in_view, (double)p_view.x, (double)p_view.y, (double)p_view.z);
+	if (!in_view)
+		return;
+	float3 p_orig = { orig_points[3 * gaussian_id], orig_points[3 * gaussian_id + 1], orig_points[3 * gaussian_id + 2] };
+	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
+	float p_w = 1.0f / (p_hom.w + 0.0000001f);
+	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
+
+	const float* cov3D;
+	if (cov3D_precomp != nullptr)
+	{
+		cov3D = cov3D_precomp + gaussian_id * 6;
+	}
+	else
+	{
+		float* cov3D_slot = cov3Ds + (cam_id * P + gaussian_id) * 6;
+		computeCov3D(scales[gaussian_id], scale_modifier, rotations[gaussian_id], cov3D_slot);
+		cov3D = cov3D_slot;
+	}
+
+	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
+
+	constexpr float h_var = 0.3f;
+	const float det_cov = cov.x * cov.z - cov.y * cov.y;
+	cov.x += h_var;
+	cov.z += h_var;
+	const float det_cov_plus_h_cov = cov.x * cov.z - cov.y * cov.y;
+	float h_convolution_scaling = 1.0f;
+	if (antialiasing)
+		h_convolution_scaling = sqrt(max(0.000025f, det_cov / det_cov_plus_h_cov));
+
+	const float det = det_cov_plus_h_cov;
+	if (det == 0.0f) return;
+	float det_inv = 1.f / det;
+	float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
+
+	float mid = 0.5f * (cov.x + cov.z);
+	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
+	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
+	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
+	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
+	uint2 rect_min, rect_max;
+	getRect(point_image, my_radius, rect_min, rect_max, grid);
+	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0) return;
+
+	if (colors_precomp == nullptr)
+	{
+		glm::vec3 result = computeColorFromSH(gaussian_id, D, M, (glm::vec3*)orig_points, cam_pos, shs, clamped + cam_id * P * 3);
+		float* rgb_slot = rgb + (cam_id * P + gaussian_id) * C;
+		rgb_slot[0] = result.x;
+		rgb_slot[1] = result.y;
+		rgb_slot[2] = result.z;
+	}
+
+	depths[idx] = p_view.z;
+	radii[idx] = my_radius;
+	points_xy_image[idx] = point_image;
+	float opacity = opacities[gaussian_id];
+	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacity * h_convolution_scaling };
+	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
+	if (probe_debug && cam_id == 0 && isProbeGaussian(gaussian_id))
+		printf("[PPROBE][PRO] gid=%d radius=%d tiles=%u det=%f cov=(%f,%f,%f)\n", (int)gaussian_id, (int)my_radius, (unsigned)tiles_touched[idx], (double)det, (double)cov.x, (double)cov.y, (double)cov.z);
+}
+
+void FORWARD::preprocessBatch(int P, int D, int M, int N,
+	const float* means3D,
+	const glm::vec3* scales,
+	const float scale_modifier,
+	const glm::vec4* rotations,
+	const float* opacities,
+	const float* shs,
+	bool* clamped,
+	const float* cov3D_precomp,
+	const float* colors_precomp,
+	const float* viewmatrixs,
+	const float* projmatrixs,
+	const glm::vec3* cam_poss,
+	const int W, int H,
+	const float focal_x, float focal_y,
+	const float tan_fovx, float tan_fovy,
+	int* radii,
+	float2* means2D,
+	float* depths,
+	float* cov3Ds,
+	float* rgb,
+	float4* conic_opacity,
+	const dim3 grid,
+	uint32_t* tiles_touched,
+	int probe_debug,
+	bool prefiltered,
+	bool antialiasing)
+{
+	int total = P * N;
+	preprocessCUDABatch<NUM_CHANNELS> << <(total + 255) / 256, 256 >> > (
+		P, D, M, N,
+		means3D,
+		scales,
+		scale_modifier,
+		rotations,
+		opacities,
+		shs,
+		clamped,
+		cov3D_precomp,
+		colors_precomp,
+		viewmatrixs,
+		projmatrixs,
+		cam_poss,
+		W, H,
+		tan_fovx, tan_fovy,
+		focal_x, focal_y,
+		radii,
+		means2D,
+		depths,
+		cov3Ds,
+		rgb,
+		conic_opacity,
+		grid,
+		tiles_touched,
+		probe_debug,
+		prefiltered,
+		antialiasing);
+}
+
+template <uint32_t CHANNELS>
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+renderCUDABatch(
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	int P, int N, int W, int H,
+	const float2* __restrict__ points_xy_image,
+	const float* __restrict__ features,
+	const float4* __restrict__ conic_opacity,
+	float* __restrict__ final_T,
+	uint32_t* __restrict__ n_contrib,
+	const float* __restrict__ bg_color,
+	float* __restrict__ out_color,
+	const float* __restrict__ depths,
+	float* __restrict__ invdepth,
+	int feature_stride)
+{
+	auto block = cg::this_thread_block();
+	int cam_id = block.group_index().z;
+	if (cam_id >= N) return;
+
+	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	uint32_t tile_count_per_cam = horizontal_blocks * ((H + BLOCK_Y - 1) / BLOCK_Y);
+	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
+	uint32_t pix_id = W * pix.y + pix.x;
+	float2 pixf = { (float)pix.x, (float)pix.y };
+
+	bool inside = pix.x < W && pix.y < H;
+	bool done = !inside;
+
+	uint2 range = ranges[cam_id * tile_count_per_cam + block.group_index().y * horizontal_blocks + block.group_index().x];
+	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+	int toDo = range.y - range.x;
+
+	__shared__ int collected_id[BLOCK_SIZE];
+	__shared__ float2 collected_xy[BLOCK_SIZE];
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+
+	const float2* cam_points = points_xy_image + cam_id * P;
+	const float4* cam_conic = conic_opacity + cam_id * P;
+	const float* cam_depths = depths + cam_id * P;
+
+	float T = 1.0f;
+	uint32_t contributor = 0;
+	uint32_t last_contributor = 0;
+	float C[CHANNELS] = { 0 };
+	float expected_invdepth = 0.0f;
+
+	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+	{
+		int num_done = __syncthreads_count(done);
+		if (num_done == BLOCK_SIZE) break;
+
+		int progress = i * BLOCK_SIZE + block.thread_rank();
+		if (range.x + progress < range.y)
+		{
+			int coll_id = point_list[range.x + progress];
+			collected_id[block.thread_rank()] = coll_id;
+			collected_xy[block.thread_rank()] = cam_points[coll_id];
+			collected_conic_opacity[block.thread_rank()] = cam_conic[coll_id];
+		}
+		block.sync();
+
+		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+		{
+			contributor++;
+			float2 xy = collected_xy[j];
+			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+			float4 con_o = collected_conic_opacity[j];
+			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+			if (power > 0.0f) continue;
+
+			float alpha = min(0.99f, con_o.w * exp(power));
+			if (alpha < 1.0f / 255.0f) continue;
+			float test_T = T * (1 - alpha);
+			if (test_T < 0.0001f) { done = true; continue; }
+
+			int feat_base = (feature_stride == 0 ? collected_id[j] * CHANNELS : cam_id * feature_stride + collected_id[j] * CHANNELS);
+			for (int ch = 0; ch < CHANNELS; ch++) C[ch] += features[feat_base + ch] * alpha * T;
+			if (invdepth) expected_invdepth += (1.0f / cam_depths[collected_id[j]]) * alpha * T;
+			T = test_T;
+			last_contributor = contributor;
+		}
+	}
+
+	if (inside)
+	{
+		final_T[cam_id * H * W + pix_id] = T;
+		n_contrib[cam_id * H * W + pix_id] = last_contributor;
+		for (int ch = 0; ch < CHANNELS; ch++)
+			out_color[(cam_id * CHANNELS + ch) * H * W + pix_id] = C[ch] + T * bg_color[ch];
+		if (invdepth) invdepth[cam_id * H * W + pix_id] = expected_invdepth;
+	}
+}
+
+void FORWARD::renderBatch(
+	const dim3 grid, dim3 block,
+	const uint2* ranges,
+	const uint32_t* point_list,
+	int P, int N, int W, int H,
+	const float2* means2D,
+	const float* colors,
+	const float4* conic_opacity,
+	float* final_T,
+	uint32_t* n_contrib,
+	const float* bg_color,
+	float* out_color,
+	float* depths,
+	float* depth,
+	int feature_stride)
+{
+	renderCUDABatch<NUM_CHANNELS> << <grid, block >> > (
+		ranges,
+		point_list,
+		P, N, W, H,
+		means2D,
+		colors,
+		conic_opacity,
+		final_T,
+		n_contrib,
+		bg_color,
+		out_color,
+		depths,
+		depth,
+		feature_stride);
 }

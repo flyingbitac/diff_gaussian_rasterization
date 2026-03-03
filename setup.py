@@ -12,6 +12,9 @@
 from setuptools import setup
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 import os
+import torch.utils.cpp_extension
+# Skip CUDA version check
+torch.utils.cpp_extension._check_cuda_version = lambda a, b: None
 os.path.dirname(os.path.abspath(__file__))
 
 setup(

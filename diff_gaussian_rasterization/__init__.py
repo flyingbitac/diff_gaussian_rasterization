@@ -156,7 +156,7 @@ class GaussianRasterizationSettings(NamedTuple):
     antialiasing : bool
 
 class GaussianRasterizer(nn.Module):
-    def __init__(self, raster_settings):
+    def __init__(self, raster_settings: GaussianRasterizationSettings):
         super().__init__()
         self.raster_settings = raster_settings
 
@@ -171,16 +171,32 @@ class GaussianRasterizer(nn.Module):
             
         return visible
 
-    def forward(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None):
-        
+    def forward(
+        self,
+        means3D,
+        means2D,
+        opacities,
+        shs = None,
+        colors_precomp = None,
+        scales = None,
+        rotations = None,
+        cov3D_precomp = None
+    ):
+
         raster_settings = self.raster_settings
 
-        if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None):
+        # Check: shs and colors_precomp should not both be empty/None
+        shs_given = shs is not None and (shs.numel() > 0 if shs.dim() > 0 else False)
+        colors_given = colors_precomp is not None and (colors_precomp.numel() > 0 if colors_precomp.dim() > 0 else False)
+        if (not shs_given and not colors_given) or (shs_given and colors_given):
             raise Exception('Please provide excatly one of either SHs or precomputed colors!')
-        
-        if ((scales is None or rotations is None) and cov3D_precomp is None) or ((scales is not None or rotations is not None) and cov3D_precomp is not None):
+
+        # Check: scales+rotations or cov3D_precomp
+        scale_rot_given = (scales is not None and (scales.numel() > 0 if scales.dim() > 0 else False)) and                          (rotations is not None and (rotations.numel() > 0 if rotations.dim() > 0 else False))
+        cov_given = cov3D_precomp is not None and (cov3D_precomp.numel() > 0 if cov3D_precomp.dim() > 0 else False)
+        if (not scale_rot_given and not cov_given) or (scale_rot_given and cov_given):
             raise Exception('Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!')
-        
+
         if shs is None:
             shs = torch.Tensor([])
         if colors_precomp is None:
@@ -200,9 +216,86 @@ class GaussianRasterizer(nn.Module):
             shs,
             colors_precomp,
             opacities,
-            scales, 
+            scales,
             rotations,
             cov3D_precomp,
-            raster_settings, 
+            raster_settings,
         )
 
+    def forward_batch_kernel(
+        self,
+        means3D,
+        means2D,
+        opacities,
+        shs=None,
+        colors_precomp=None,
+        scales=None,
+        rotations=None,
+        cov3D_precomp=None
+    ):
+        """
+        Batch rasterization using kernel version (single forward call for N cameras).
+        
+        Parameters:
+        - means3D: (P, 3)
+        - opacities: (P, 1)
+        - shs: (P, M, 3) OR None
+        - colors_precomp: (P, 3) OR None
+        - scales: (P, 3) OR None
+        - rotations: (P, 4) OR None
+        - cov3D_precomp: (P, 6) OR None
+
+        Returns:
+        - color: (N, 3, H, W)
+        - radii: (N, P)
+        - invdepths: (N, 1, H, W)
+        """
+        raster_settings = self.raster_settings
+
+        shs_given = shs is not None and shs.numel() > 0
+        colors_given = colors_precomp is not None and colors_precomp.numel() > 0
+        if (not shs_given and not colors_given) or (shs_given and colors_given):
+            raise Exception('Please provide exactly one of either SHs or precomputed colors!')
+
+        scale_rot_given = (scales is not None and scales.numel() > 0) and (rotations is not None and rotations.numel() > 0)
+        cov_given = cov3D_precomp is not None and cov3D_precomp.numel() > 0
+        if (not scale_rot_given and not cov_given) or (scale_rot_given and cov_given):
+            raise Exception('Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!')
+
+        device = means3D.device
+
+        if shs is None or shs.numel() == 0:
+            shs = torch.empty((means3D.shape[0], 0, 3), dtype=torch.float32, device=device)
+        if colors_precomp is None or colors_precomp.numel() == 0:
+            colors_precomp = torch.empty((means3D.shape[0], 3), dtype=torch.float32, device=device)
+        if scales is None or scales.numel() == 0:
+            scales = torch.empty((means3D.shape[0], 3), dtype=torch.float32, device=device)
+        if rotations is None or rotations.numel() == 0:
+            rotations = torch.empty((means3D.shape[0], 4), dtype=torch.float32, device=device)
+        if cov3D_precomp is None or cov3D_precomp.numel() == 0:
+            cov3D_precomp = torch.empty((0,), dtype=torch.float32, device=device)
+
+        _, color, radii, _, _, _, invdepths = _C.rasterize_gaussians_batch_kernel(
+            raster_settings.bg,
+            means3D,
+            colors_precomp,
+            opacities,
+            scales,
+            rotations,
+            raster_settings.scale_modifier,
+            cov3D_precomp,
+            raster_settings.viewmatrix.contiguous(),
+            raster_settings.projmatrix.contiguous(),
+            raster_settings.tanfovx,
+            raster_settings.tanfovy,
+            raster_settings.image_height,
+            raster_settings.image_width,
+            shs,
+            raster_settings.sh_degree,
+            raster_settings.campos.contiguous(),
+            raster_settings.prefiltered,
+            raster_settings.antialiasing,
+            raster_settings.debug,
+        )
+
+        return color, radii, invdepths
