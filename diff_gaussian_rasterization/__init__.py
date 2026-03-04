@@ -267,7 +267,7 @@ class GaussianRasterizer(nn.Module):
         if shs is None or shs.numel() == 0:
             shs = torch.empty((means3D.shape[0], 0, 3), dtype=torch.float32, device=device)
         if colors_precomp is None or colors_precomp.numel() == 0:
-            colors_precomp = torch.empty((means3D.shape[0], 3), dtype=torch.float32, device=device)
+            colors_precomp = torch.empty((0,), dtype=torch.float32, device=device)
         if scales is None or scales.numel() == 0:
             scales = torch.empty((means3D.shape[0], 3), dtype=torch.float32, device=device)
         if rotations is None or rotations.numel() == 0:

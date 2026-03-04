@@ -93,12 +93,6 @@ RasterizeGaussiansCUDA(
 		M = sh.size(1);
       }
 
-	  const float* sh_ptr = sh.numel() > 0 ? sh.contiguous().data_ptr<float>() : nullptr;
-	  const float* colors_ptr = colors.numel() > 0 ? colors.contiguous().data_ptr<float>() : nullptr;
-	  const float* scales_ptr = scales.numel() > 0 ? scales.contiguous().data_ptr<float>() : nullptr;
-	  const float* rotations_ptr = rotations.numel() > 0 ? rotations.contiguous().data_ptr<float>() : nullptr;
-	  const float* cov3D_precomp_ptr = cov3D_precomp.numel() > 0 ? cov3D_precomp.contiguous().data_ptr<float>() : nullptr;
-
 	  rendered = CudaRasterizer::Rasterizer::forward(
 	    geomFunc,
 		binningFunc,
@@ -107,13 +101,13 @@ RasterizeGaussiansCUDA(
 		background.contiguous().data<float>(),
 		W, H,
 		means3D.contiguous().data<float>(),
-		sh_ptr,
-		colors_ptr,
+		sh.contiguous().data_ptr<float>(),
+		colors.contiguous().data<float>(), 
 		opacity.contiguous().data<float>(), 
-		scales_ptr,
+		scales.contiguous().data_ptr<float>(),
 		scale_modifier,
-		rotations_ptr,
-		cov3D_precomp_ptr,
+		rotations.contiguous().data_ptr<float>(),
+		cov3D_precomp.contiguous().data<float>(), 
 		viewmatrix.contiguous().data<float>(), 
 		projmatrix.contiguous().data<float>(),
 		campos.contiguous().data<float>(),
@@ -334,6 +328,10 @@ RasterizeGaussiansBatchKernelCUDA(
   const float* rotations_ptr = rotations_c.numel() > 0 ? rotations_c.data_ptr<float>() : nullptr;
   const float* cov3D_precomp_ptr = cov3D_precomp_c.numel() > 0 ? cov3D_precomp_c.data_ptr<float>() : nullptr;
   const float* bg_ptr = background_c.data_ptr<float>();
+
+  if ((sh_ptr == nullptr && colors_ptr == nullptr) || (sh_ptr != nullptr && colors_ptr != nullptr)) {
+    AT_ERROR("Batch rasterization expects exactly one of SHs or precomputed colors.");
+  }
 
   float* color_ptr = out_color.data_ptr<float>();
   float* depth_ptr = out_invdepth.data_ptr<float>();

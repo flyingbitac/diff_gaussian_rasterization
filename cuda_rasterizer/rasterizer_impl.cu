@@ -32,30 +32,40 @@ namespace cg = cooperative_groups;
 #include "backward.h"
 
 static bool gs_preprocess_probe_enabled() {
+	// Read a process environment variable once per call. This is CPU-side code:
+	// it decides whether extra debug instrumentation should be enabled before
+	// any GPU kernel is launched.
 	const char* env = std::getenv("GS_PREPROCESS_PROBE");
 	return env && env[0] == '1';
 }
 
 static bool gs_batch_debug_enabled() {
+    // Same idea as above, but for the batched rendering path.
     const char* env = std::getenv("GS_BATCH_DEBUG");
     return env && atoi(env) == 1;
 }
 
 __global__ void computeRadiiPosCountKernel(int* radii, int P, int N, int* out_counts) {
+    // __global__ means "this function runs on the GPU and is launched from the CPU".
+    // Every GPU thread computes one linear index into the flattened (N, P) array.
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= P * N) return;
     if (radii[idx] > 0) {
+        // Multiple threads may update the same camera counter concurrently, so this
+        // must be atomic to avoid lost increments.
         atomicAdd(&out_counts[idx / P], 1);
     }
 }
 
 __global__ void computeTilesTouchedSumKernel(uint32_t* tiles_touched, int P, int N, uint32_t* out_sums) {
+    // Sum "tiles touched" per camera over a flattened (N, P) layout.
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= P * N) return;
     atomicAdd(&out_sums[idx / P], tiles_touched[idx]);
 }
 
 __global__ void computeRangesValidCountKernel(uint2* ranges, int N, int tile_count, int* out_valid, int* out_oob) {
+    // Debug helper: each uint2 stores [start, end) for one tile's workload.
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N * tile_count) return;
     uint2 range = ranges[idx];
@@ -68,6 +78,8 @@ __global__ void computeRangesValidCountKernel(uint2* ranges, int N, int tile_cou
 }
 
 __global__ void computeOutColorNonzeroCountKernel(float* out_color, int N, int C, int H, int W, int* out_counts) {
+    // Count how many output pixels/channels are non-zero per camera.
+    // The output tensor is flattened as (N, C, H, W).
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N * C * H * W) return;
     int cam_id = idx / (C * H * W);
@@ -80,6 +92,9 @@ __global__ void computeOutColorNonzeroCountKernel(float* out_color, int N, int C
 // on the CPU.
 uint32_t getHigherMsb(uint32_t n)
 {
+	// This is ordinary CPU code. It estimates how many high bits are needed to
+	// represent values up to n, which is later used to tell CUB how many key bits
+	// must participate in radix sort.
 	uint32_t msb = sizeof(n) * 4;
 	uint32_t step = msb;
 	while (step > 1)
@@ -103,11 +118,15 @@ __global__ void checkFrustum(int P,
 	const float* projmatrix,
 	bool* present)
 {
+	// cooperative_groups::this_grid().thread_rank() gives one global linear thread
+	// index across the entire launched grid, so we do not have to manually combine
+	// blockIdx / threadIdx here.
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
 		return;
 
 	float3 p_view;
+	// Each thread checks one Gaussian and writes a boolean visibility flag.
 	present[idx] = in_frustum(idx, orig_points, viewmatrix, projmatrix, false, p_view);
 }
 
@@ -131,6 +150,8 @@ __global__ void duplicateWithKeys(
 	if (radii[idx] > 0)
 	{
 		// Find this Gaussian's offset in buffer for writing keys/values.
+		// point_offsets is an inclusive prefix sum, so the start of this Gaussian's
+		// slice is the previous entry (or 0 for the first element).
 		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
 		uint2 rect_min, rect_max;
 
@@ -145,6 +166,9 @@ __global__ void duplicateWithKeys(
 		{
 			for (int x = rect_min.x; x < rect_max.x; x++)
 			{
+				// The 64-bit key packs tile id in the upper 32 bits and depth bits in
+				// the lower 32 bits. Sorting by this key groups items by tile first,
+				// then orders them by depth inside each tile.
 				uint64_t key = y * grid.x + x;
 				key <<= 32;
 				key |= *((uint32_t*)&depths[idx]);
@@ -173,6 +197,7 @@ __global__ void duplicateWithKeysBatch(
 {
 	// Each thread handles one (camera, gaussian) pair
 	// Global index = cam_id * P + gaussian_id
+	// This is a common CUDA pattern: flatten a 2D logical problem into a 1D thread id.
 	auto idx = cg::this_grid().thread_rank();
 	int cam_id = idx / P;
 	int gaussian_id = idx % P;
@@ -181,6 +206,8 @@ __global__ void duplicateWithKeysBatch(
 		return;
 
 	// Get per-camera data (assuming contiguous memory: points_xy[cam_id*P + gaussian_id])
+	// Pointer arithmetic here simply slices the flattened arrays so later code can
+	// index as if it were working on one camera at a time.
 	const float2* cam_points_xy = points_xy + cam_id * P;
 	const float* cam_depths = depths + cam_id * P;
 	const int* cam_radii = radii + cam_id * P;
@@ -206,14 +233,14 @@ __global__ void duplicateWithKeysBatch(
 			{
 				uint64_t key = 0;
 				
-				// Pack camera_id in bits 48-63 (upper 16 bits)
+				// Manually pack several sort fields into one integer key:
+				// camera in the top 16 bits, tile in the next 16 bits, depth in the
+				// low 32 bits.
 				key |= ((uint64_t)cam_id & 0xFFFF) << 48;
 				
-				// Pack tile_id in bits 32-47 (middle 16 bits)
 				uint32_t tile_id = y * grid.x + x;
 				key |= ((uint64_t)tile_id & 0xFFFF) << 32;
 				
-				// Pack depth in lower 32 bits
 				key |= *((uint32_t*)&cam_depths[gaussian_id]);
 				
 				gaussian_keys_unsorted[off] = key;
@@ -234,7 +261,8 @@ __global__ void identifyTileRanges(int L, uint64_t* point_list_keys, uint2* rang
 	if (idx >= L)
 		return;
 
-	// Read tile ID from key. Update start/end of tile range if at limit.
+	// Read tile ID from the sorted keys. Because keys are already sorted, whenever
+	// the tile id changes we have found a boundary between two contiguous ranges.
 	uint64_t key = point_list_keys[idx];
 	uint32_t currtile = key >> 32;
 	if (idx == 0)
@@ -260,8 +288,7 @@ __global__ void identifyTileRangesBatch(int L, int num_cameras, int tile_count, 
 	if (idx >= L)
 		return;
 
-	// Extract camera_id and tile_id from key
-	// key format: | camera_id(16) | tile_id(16) | depth(32) |
+	// Decode the packed sort key produced in duplicateWithKeysBatch.
 	uint64_t key = point_list_keys[idx];
 	uint32_t curr_camera = (key >> 48) & 0xFFFF;  // upper 16 bits
 	uint32_t curr_tile = (key >> 32) & 0xFFFF;    // middle 16 bits
@@ -294,6 +321,8 @@ void CudaRasterizer::Rasterizer::markVisible(
 	float* projmatrix,
 	bool* present)
 {
+	// Launch enough 1D thread blocks so there is at least one GPU thread per Gaussian.
+	// The <<<grid, block>>> syntax is the CUDA kernel launch syntax.
 	checkFrustum << <(P + 255) / 256, 256 >> > (
 		P,
 		means3D,
@@ -304,6 +333,8 @@ void CudaRasterizer::Rasterizer::markVisible(
 CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& chunk, size_t P)
 {
 	GeometryState geom;
+	// obtain(...) carves typed sub-buffers out of one preallocated device-memory chunk.
+	// This avoids many small cudaMalloc calls and keeps allocation centralized.
 	obtain(chunk, geom.depths, P, 128);
 	obtain(chunk, geom.clamped, P * 3, 128);
 	obtain(chunk, geom.internal_radii, P, 128);
@@ -313,6 +344,8 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	obtain(chunk, geom.rgb, P * 3, 128);
 	obtain(chunk, geom.tiles_touched, P, 128);
 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
+	// The call above is a standard CUB pattern: passing nullptr asks CUB how much
+	// temporary storage the scan will need, without executing the scan yet.
 	obtain(chunk, geom.scanning_space, geom.scan_size, 128);
 	obtain(chunk, geom.point_offsets, P, 128);
 	return geom;
@@ -338,6 +371,7 @@ CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chun
 		nullptr, binning.sorting_size,
 		binning.point_list_keys_unsorted, binning.point_list_keys,
 		binning.point_list_unsorted, binning.point_list, P);
+	// Same two-step pattern as above: query scratch size first, then allocate it.
 	obtain(chunk, binning.list_sorting_space, binning.sorting_size, 128);
 	return binning;
 }
@@ -411,6 +445,8 @@ int CudaRasterizer::Rasterizer::forward(
 	int* radii,
 	bool debug)
 {
+	// This is CPU-side orchestration code. It allocates temporary GPU buffers,
+	// launches GPU kernels, and calls into helper modules that do the actual math.
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
@@ -420,11 +456,15 @@ int CudaRasterizer::Rasterizer::forward(
 
 	if (radii == nullptr)
 	{
+		// If the caller does not provide an output buffer for radii, use the internal
+		// temporary buffer owned by GeometryState.
 		radii = geomState.internal_radii;
 	}
 
 	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
 	dim3 block(BLOCK_X, BLOCK_Y, 1);
+	// tile_grid describes how many screen-space tiles cover the image.
+	// block describes the per-tile thread block shape used by the render kernel.
 
 	// Dynamically resize image-based auxiliary buffers during training
 	size_t img_chunk_size = required<ImageState>(width * height);
@@ -466,14 +506,20 @@ int CudaRasterizer::Rasterizer::forward(
 		prefiltered,
 		antialiasing
 	), debug)
+	// preprocess runs on the GPU and computes all per-Gaussian screen-space data
+	// needed for rendering: projected mean, covariance, color, opacity, tile count.
 
 	// Compute prefix sum over full list of touched tile counts by Gaussians
 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
 	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
+	// After this scan, point_offsets[i] tells us how many duplicated entries exist
+	// up to and including Gaussian i. That lets each thread reserve its output slice.
 
 	// Retrieve total number of Gaussian instances to launch and resize aux buffers
 	int num_rendered;
 	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+	// Copy one integer from GPU memory back to CPU memory so the host knows how much
+	// binning storage to allocate for the next stage.
 	if (debug)
 		std::cout << "[Rasterizer::forward] P=" << P
 				<< ", image=" << width << "x" << height
@@ -496,6 +542,7 @@ int CudaRasterizer::Rasterizer::forward(
 		radii,
 		tile_grid);
 	CHECK_CUDA(cudaGetLastError(), debug)
+	// duplicateWithKeys expands one Gaussian into many per-tile records.
 
 	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
 
@@ -506,6 +553,8 @@ int CudaRasterizer::Rasterizer::forward(
 		binningState.point_list_keys_unsorted, binningState.point_list_keys,
 		binningState.point_list_unsorted, binningState.point_list,
 		num_rendered, 0, 32 + bit), debug)
+	// Radix sort reorders both arrays together: keys are sorted, and the Gaussian
+	// indices move with their keys.
 
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
 
@@ -516,6 +565,7 @@ int CudaRasterizer::Rasterizer::forward(
 			binningState.point_list_keys,
 			imgState.ranges);
 	CHECK_CUDA(cudaGetLastError(), debug)
+	// ranges now stores, for each tile, the [start, end) slice inside point_list.
 
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
@@ -533,6 +583,8 @@ int CudaRasterizer::Rasterizer::forward(
 		out_color,
 		geomState.depths,
 		depth), debug)
+	// render launches one thread block per tile; each block blends all Gaussians that
+	// overlap that tile into the final image.
 
 	return num_rendered;
 }
@@ -574,6 +626,9 @@ void CudaRasterizer::Rasterizer::backward(
 	bool antialiasing,
 	bool debug)
 {
+	// backward reuses the temporary buffers from the forward pass. The buffers are
+	// reconstructed from raw memory chunks so the gradient code can access the same
+	// intermediate values without recomputing all of them.
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
 	ImageState imgState = ImageState::fromChunk(img_buffer, width * height);
@@ -613,6 +668,7 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dopacity,
 		dL_dcolor,
 		dL_dinvdepth), debug);
+	// First compute gradients coming from the image-domain blending step.
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
@@ -644,6 +700,7 @@ void CudaRasterizer::Rasterizer::backward(
 		(glm::vec3*)dL_dscale,
 		(glm::vec4*)dL_drot,
 		antialiasing), debug);
+	// Then propagate those gradients back through the projection / covariance setup.
 }
 
 // Batch forward: render N cameras in a single kernel launch
@@ -674,6 +731,9 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 	int* radii,
 	bool debug)
 {
+	// forwardBatch is the batched analogue of forward: instead of launching the whole
+	// pipeline once per camera, it flattens (camera, Gaussian) work into shared GPU
+	// buffers and processes all cameras in one pass.
 	const bool gs_batch_debug = gs_batch_debug_enabled();
 	const int probe_debug = gs_preprocess_probe_enabled() ? 1 : 0;
 	
@@ -686,6 +746,8 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 
 	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, N);
 	dim3 block(BLOCK_X, BLOCK_Y, 1);
+	// Here tile_grid.z stores the camera count. Downstream kernels use the third grid
+	// dimension to distinguish cameras while reusing the same 2D tile layout.
 
 	size_t geom_chunk_size = required<GeometryStateBatch>(P, N);
 	char* geom_chunkptr = geometryBuffer(geom_chunk_size);
@@ -735,6 +797,7 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 		prefiltered,
 		antialiasing
 	), debug)
+	// preprocessBatch computes per-camera, per-Gaussian projected attributes.
 
 	if (gs_batch_debug) {
 		auto ret = cudaDeviceSynchronize();
@@ -810,6 +873,7 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 		binningState.point_list_unsorted,
 		radii,
 		tile_grid)), debug)
+	// Each GPU thread emits all tile-overlap records for exactly one (camera, Gaussian).
 
 	if (gs_batch_debug) {
 		auto ret = cudaDeviceSynchronize();
@@ -821,7 +885,8 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 	}
 
 	// STAGE 4: sort
-	// For batch, we use 48 bits for key (16 bit camera + 16 bit tile + 16 bit depth)
+	// The packed key includes camera and tile information, so a single global sort
+	// groups records by camera first, then by tile, then by depth.
 	int bit = getHigherMsb(tile_grid.x * tile_grid.y) + 16;  // +16 for camera_id bits
 
 	// Sort by keys using actual num_rendered
@@ -831,6 +896,7 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 		binningState.point_list_keys_unsorted, binningState.point_list_keys,
 		binningState.point_list_unsorted, binningState.point_list,
 		num_rendered, 0, 64), debug)
+	// The code sorts the full 64-bit key range for simplicity.
 
 	if (gs_batch_debug) {
 		auto ret = cudaDeviceSynchronize();
@@ -858,6 +924,7 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 	// STAGE 5: identifyTileRangesBatch
 	// Initialize ranges
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, N * num_tiles_per_cam * sizeof(uint2)), debug);
+	// cudaMemset writes device memory from the CPU side; here we clear the output range table.
 
 	// Identify start and end of per-(camera, tile) workloads
 	if (num_rendered > 0)
@@ -868,6 +935,7 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 			binningState.point_list_keys,
 			imgState.ranges);
 	CHECK_CUDA(cudaGetLastError(), debug)
+	// imgState.ranges is indexed as [camera * tiles_per_camera + tile].
 
 	if (gs_batch_debug) {
 		auto ret = cudaDeviceSynchronize();
@@ -911,6 +979,8 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 		geomState.depths,
 		depth,
 		feature_stride), debug)
+	// renderBatch consumes the per-(camera, tile) ranges and writes all camera images
+	// into one flattened output buffer.
 
 	if (gs_batch_debug) {
 		auto ret = cudaDeviceSynchronize();
