@@ -76,7 +76,8 @@ namespace FORWARD
 		uint32_t* tiles_touched,   // (N, P)
 		int probe_debug,
 		bool prefiltered,
-		bool antialiasing);
+		bool antialiasing,
+		bool render_color);
 
 	// Main rasterization method.
 	void render(
@@ -109,7 +110,7 @@ namespace FORWARD
 		float* out_color,               // (N, 3, H, W)
 		float* depths,                  // (N, P)
 		float* depth,                   // (N, 1, H, W)
-		int feature_stride);            // 0 for shared colors_precomp, P*3 for per-camera SH
+		int feature_stride);            // 0 for shared colors_precomp, P*3 for per-camera SH, -1 for no color
 }
 
 

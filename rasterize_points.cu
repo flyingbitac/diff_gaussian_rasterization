@@ -12,20 +12,37 @@
 #include <math.h>
 #include <torch/extension.h>
 #include <cstdio>
+#include <cstdlib>
 #include <sstream>
 #include <iostream>
 #include <tuple>
 #include <stdio.h>
 #include <cuda_runtime_api.h>
 #include <memory>
+#include <stdexcept>
 #include "cuda_rasterizer/config.h"
 #include "cuda_rasterizer/rasterizer.h"
 #include <fstream>
 #include <string>
 #include <functional>
 
-std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
-    auto lambda = [&t](size_t N) {
+static bool gs_batch_debug_enabled_cpp() {
+    const char* env = std::getenv("GS_BATCH_DEBUG");
+    return env && atoi(env) == 1;
+}
+
+std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t, const char* name = "buffer") {
+    auto lambda = [&t, name](size_t N) {
+        constexpr size_t kMaxReasonableBufferBytes = size_t(1) << 40;
+        if (gs_batch_debug_enabled_cpp()) {
+            std::cout << "[GS_BATCH_DEBUG] resize " << name << " bytes=" << N << std::endl;
+        }
+        if (N > kMaxReasonableBufferBytes) {
+            std::ostringstream oss;
+            oss << "Refusing to allocate " << N << " bytes for CUDA rasterizer " << name << "; "
+                << "this indicates a corrupted batch size or tile-overlap count.";
+            throw std::runtime_error(oss.str());
+        }
         t.resize_({(long long)N});
 		return reinterpret_cast<char*>(t.contiguous().data_ptr());
     };
@@ -80,9 +97,9 @@ RasterizeGaussiansCUDA(
   torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
   torch::Tensor binningBuffer = torch::empty({0}, options.device(device));
   torch::Tensor imgBuffer = torch::empty({0}, options.device(device));
-  std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
-  std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
-  std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
+  std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer, "geomBuffer");
+  std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer, "binningBuffer");
+  std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer, "imgBuffer");
   
   int rendered = 0;
   if(P != 0)
@@ -244,8 +261,8 @@ torch::Tensor markVisible(
 }
 
 // True batch kernel version: single forward call for N cameras using batch kernels
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-RasterizeGaussiansBatchKernelCUDA(
+static std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+RasterizeGaussiansBatchKernelCUDAImpl(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
     const torch::Tensor& colors,
@@ -265,8 +282,14 @@ RasterizeGaussiansBatchKernelCUDA(
 	const torch::Tensor& campos,
 	const bool prefiltered,
 	const bool antialiasing,
-	const bool debug)
+	const bool debug,
+	const bool render_color,
+	const bool render_depth,
+	const bool return_radii)
 {
+  if (!render_color && !render_depth) {
+    AT_ERROR("Batch rasterization compact path must render color, depth, or both.");
+  }
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
     AT_ERROR("means3D must have dimensions (num_points, 3)");
   }
@@ -276,6 +299,7 @@ RasterizeGaussiansBatchKernelCUDA(
   const int P = means3D.size(0);
   const int H = image_height;
   const int W = image_width;
+  const bool gs_debug = gs_batch_debug_enabled_cpp();
 
   // Validate batch tensor shapes
   if (viewmatrix.size(1) != 4 || viewmatrix.size(2) != 4) {
@@ -287,14 +311,32 @@ RasterizeGaussiansBatchKernelCUDA(
   if (campos.size(0) != N || campos.size(1) != 3) {
     AT_ERROR("campos must have shape (N, 3)");
   }
+  if (N <= 0 || H <= 0 || W <= 0) {
+    AT_ERROR("Batch rasterization expects positive N, image_height, and image_width.");
+  }
+  if (gs_debug) {
+    std::cout << "[GS_BATCH_DEBUG] compact wrapper: P=" << P
+              << ", N=" << N
+              << ", image=" << W << "x" << H
+              << ", render_color=" << render_color
+              << ", render_depth=" << render_depth
+              << ", return_radii=" << return_radii
+              << std::endl;
+  }
 
   auto int_opts = means3D.options().dtype(torch::kInt32);
   auto float_opts = means3D.options().dtype(torch::kFloat32);
 
-  // Output tensors: (N, 3, H, W), (N, 1, H, W), (N, P)
-  torch::Tensor out_color = torch::full({N, NUM_CHANNELS, H, W}, 0.0, float_opts);
-  torch::Tensor out_invdepth = torch::full({N, 1, H, W}, 0.0, float_opts);
-  torch::Tensor radii = torch::full({N, P}, 0, int_opts);
+  // Output tensors: optional (N, 3, H, W), optional (N, 1, H, W), optional (N, P)
+  torch::Tensor out_color = render_color
+    ? torch::full({N, NUM_CHANNELS, H, W}, 0.0, float_opts)
+    : torch::empty({0}, float_opts);
+  torch::Tensor out_invdepth = render_depth
+    ? torch::full({N, 1, H, W}, 0.0, float_opts)
+    : torch::empty({0}, float_opts);
+  torch::Tensor radii = return_radii
+    ? torch::full({N, P}, 0, int_opts)
+    : torch::empty({0}, int_opts);
 
   // Dummy buffers for backward compatibility (forward-only)
   torch::Device device(torch::kCUDA);
@@ -329,23 +371,30 @@ RasterizeGaussiansBatchKernelCUDA(
   const float* cov3D_precomp_ptr = cov3D_precomp_c.numel() > 0 ? cov3D_precomp_c.data_ptr<float>() : nullptr;
   const float* bg_ptr = background_c.data_ptr<float>();
 
-  if ((sh_ptr == nullptr && colors_ptr == nullptr) || (sh_ptr != nullptr && colors_ptr != nullptr)) {
-    AT_ERROR("Batch rasterization expects exactly one of SHs or precomputed colors.");
+  if (render_color && ((sh_ptr == nullptr && colors_ptr == nullptr) || (sh_ptr != nullptr && colors_ptr != nullptr))) {
+    AT_ERROR("Batch rasterization expects exactly one of SHs or precomputed colors when color output is enabled.");
   }
 
-  float* color_ptr = out_color.data_ptr<float>();
-  float* depth_ptr = out_invdepth.data_ptr<float>();
-  int* radii_ptr = radii.data_ptr<int>();
+  float* color_ptr = render_color ? out_color.data_ptr<float>() : nullptr;
+  float* depth_ptr = render_depth ? out_invdepth.data_ptr<float>() : nullptr;
+  int* radii_ptr = return_radii ? radii.data_ptr<int>() : nullptr;
 
   int M = 0;
   if (sh.size(0) != 0) {
     M = sh.size(1);
   }
+  if (gs_debug) {
+    std::cout << "[GS_BATCH_DEBUG] compact inputs: M=" << M
+              << ", sh_numel=" << sh_c.numel()
+              << ", colors_numel=" << colors_c.numel()
+              << ", cov_numel=" << cov3D_precomp_c.numel()
+              << std::endl;
+  }
 
   // Call the batch forward kernel
-  std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
-  std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
-  std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
+  std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer, "geomBuffer");
+  std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer, "binningBuffer");
+  std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer, "imgBuffer");
 
   int rendered = 0;
   if (P != 0) {
@@ -378,11 +427,75 @@ RasterizeGaussiansBatchKernelCUDA(
       debug);
   }
 
-  // Debug: strict error checking for forwardBatch
-  auto err = cudaGetLastError();
-  if (err != cudaSuccess) AT_ERROR("forwardBatch launch failed: ", cudaGetErrorString(err));
-  err = cudaDeviceSynchronize();
-  if (err != cudaSuccess) AT_ERROR("forwardBatch sync failed: ", cudaGetErrorString(err));
+  if (debug || gs_debug) {
+    auto err = cudaGetLastError();
+    if (err != cudaSuccess) AT_ERROR("forwardBatch launch failed: ", cudaGetErrorString(err));
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) AT_ERROR("forwardBatch sync failed: ", cudaGetErrorString(err));
+  }
 
   return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_invdepth);
+}
+
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+RasterizeGaussiansBatchKernelCUDA(
+	const torch::Tensor& background,
+	const torch::Tensor& means3D,
+    const torch::Tensor& colors,
+    const torch::Tensor& opacity,
+	const torch::Tensor& scales,
+	const torch::Tensor& rotations,
+	const float scale_modifier,
+	const torch::Tensor& cov3D_precomp,
+	const torch::Tensor& viewmatrix,
+	const torch::Tensor& projmatrix,
+	const float tan_fovx, 
+	const float tan_fovy,
+    const int image_height,
+    const int image_width,
+	const torch::Tensor& sh,
+	const int degree,
+	const torch::Tensor& campos,
+	const bool prefiltered,
+	const bool antialiasing,
+	const bool debug)
+{
+  return RasterizeGaussiansBatchKernelCUDAImpl(
+    background, means3D, colors, opacity, scales, rotations, scale_modifier,
+    cov3D_precomp, viewmatrix, projmatrix, tan_fovx, tan_fovy, image_height,
+    image_width, sh, degree, campos, prefiltered, antialiasing, debug,
+    true, true, true);
+}
+
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+RasterizeGaussiansBatchKernelCompactCUDA(
+	const torch::Tensor& background,
+	const torch::Tensor& means3D,
+    const torch::Tensor& colors,
+    const torch::Tensor& opacity,
+	const torch::Tensor& scales,
+	const torch::Tensor& rotations,
+	const float scale_modifier,
+	const torch::Tensor& cov3D_precomp,
+	const torch::Tensor& viewmatrix,
+	const torch::Tensor& projmatrix,
+	const float tan_fovx, 
+	const float tan_fovy,
+    const int image_height,
+    const int image_width,
+	const torch::Tensor& sh,
+	const int degree,
+	const torch::Tensor& campos,
+	const bool prefiltered,
+	const bool antialiasing,
+	const bool debug,
+	const bool render_color,
+	const bool render_depth,
+	const bool return_radii)
+{
+  return RasterizeGaussiansBatchKernelCUDAImpl(
+    background, means3D, colors, opacity, scales, rotations, scale_modifier,
+    cov3D_precomp, viewmatrix, projmatrix, tan_fovx, tan_fovy, image_height,
+    image_width, sh, degree, campos, prefiltered, antialiasing, debug,
+    render_color, render_depth, return_radii);
 }

@@ -70,16 +70,16 @@ namespace CudaRasterizer
 		size_t scan_size;
 		float* depths;           // (N, P)
 		char* scanning_space;
-		bool* clamped;           // (N, P, 3)
+		bool* clamped;           // (N, P, 3), only when SH RGB is rendered
 		int* internal_radii;     // (N, P)
 		float2* means2D;         // (N, P)
-		float* cov3D;            // (N, P, 6)
+		float* cov3D;            // (P, 6), shared across cameras
 		float4* conic_opacity;   // (N, P)
-		float* rgb;              // (P, 3) - shared (view-independent)
+		float* rgb;              // (N, P, 3), only when SH RGB is rendered
 		uint32_t* point_offsets; // (N, P)
 		uint32_t* tiles_touched; // (N, P)
 
-		static GeometryStateBatch fromChunk(char*& chunk, size_t P, size_t N);
+		static GeometryStateBatch fromChunk(char*& chunk, size_t P, size_t N, bool needs_sh_color);
 	};
 
 	struct ImageStateBatch

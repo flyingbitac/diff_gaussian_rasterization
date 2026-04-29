@@ -111,8 +111,8 @@ namespace CudaRasterizer
 			const float* cam_pos,      // (N, 3)
 			const float tan_fovx, float tan_fovy,
 			const bool prefiltered,
-			float* out_color,          // (N, 3, H, W)
-			float* depth,              // (N, 1, H, W)
+			float* out_color,          // optional (N, 3, H, W)
+			float* depth,              // optional (N, 1, H, W)
 			bool antialiasing,
 			int* radii = nullptr,      // (N, P)
 			bool debug = false);

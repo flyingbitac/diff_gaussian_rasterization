@@ -10,6 +10,7 @@
 #
 
 from typing import NamedTuple
+import os
 import torch.nn as nn
 import torch
 from . import _C
@@ -296,6 +297,93 @@ class GaussianRasterizer(nn.Module):
             raster_settings.prefiltered,
             raster_settings.antialiasing,
             raster_settings.debug,
+        )
+
+        return color, radii, invdepths
+
+    def forward_batch_kernel_compact(
+        self,
+        means3D,
+        means2D,
+        opacities,
+        shs=None,
+        colors_precomp=None,
+        scales=None,
+        rotations=None,
+        cov3D_precomp=None,
+        render_color=True,
+        render_depth=True,
+        return_radii=False,
+    ):
+        """
+        Batch rasterization with optional outputs to reduce peak memory.
+
+        Returns empty tensors for disabled outputs.
+        """
+        raster_settings = self.raster_settings
+
+        if not render_color and not render_depth:
+            raise Exception('Please enable at least one of render_color or render_depth!')
+
+        shs_given = shs is not None and shs.numel() > 0
+        colors_given = colors_precomp is not None and colors_precomp.numel() > 0
+        if render_color and ((not shs_given and not colors_given) or (shs_given and colors_given)):
+            raise Exception('Please provide exactly one of either SHs or precomputed colors when rendering color!')
+
+        scale_rot_given = (scales is not None and scales.numel() > 0) and (rotations is not None and rotations.numel() > 0)
+        cov_given = cov3D_precomp is not None and cov3D_precomp.numel() > 0
+        if (not scale_rot_given and not cov_given) or (scale_rot_given and cov_given):
+            raise Exception('Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!')
+
+        device = means3D.device
+
+        if shs is None or shs.numel() == 0:
+            shs = torch.empty((means3D.shape[0], 0, 3), dtype=torch.float32, device=device)
+        if colors_precomp is None or colors_precomp.numel() == 0:
+            colors_precomp = torch.empty((0,), dtype=torch.float32, device=device)
+        if scales is None or scales.numel() == 0:
+            scales = torch.empty((means3D.shape[0], 3), dtype=torch.float32, device=device)
+        if rotations is None or rotations.numel() == 0:
+            rotations = torch.empty((means3D.shape[0], 4), dtype=torch.float32, device=device)
+        if cov3D_precomp is None or cov3D_precomp.numel() == 0:
+            cov3D_precomp = torch.empty((0,), dtype=torch.float32, device=device)
+
+        if os.environ.get("GS_BATCH_DEBUG") == "1":
+            print(
+                "[GS_BATCH_DEBUG] python compact: "
+                f"_C={getattr(_C, '__file__', '<unknown>')}, "
+                f"P={means3D.shape[0]}, N={raster_settings.viewmatrix.shape[0]}, "
+                f"image={raster_settings.image_width}x{raster_settings.image_height}, "
+                f"render_color={render_color}, render_depth={render_depth}, "
+                f"return_radii={return_radii}, sh_numel={shs.numel()}, "
+                f"colors_numel={colors_precomp.numel()}, cov_numel={cov3D_precomp.numel()}",
+                flush=True,
+            )
+
+        _, color, radii, _, _, _, invdepths = _C.rasterize_gaussians_batch_kernel_compact(
+            raster_settings.bg,
+            means3D,
+            colors_precomp,
+            opacities,
+            scales,
+            rotations,
+            raster_settings.scale_modifier,
+            cov3D_precomp,
+            raster_settings.viewmatrix.contiguous(),
+            raster_settings.projmatrix.contiguous(),
+            raster_settings.tanfovx,
+            raster_settings.tanfovy,
+            raster_settings.image_height,
+            raster_settings.image_width,
+            shs,
+            raster_settings.sh_degree,
+            raster_settings.campos.contiguous(),
+            raster_settings.prefiltered,
+            raster_settings.antialiasing,
+            raster_settings.debug,
+            render_color,
+            render_depth,
+            return_radii,
         )
 
         return color, radii, invdepths

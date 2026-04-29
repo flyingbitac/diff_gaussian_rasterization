@@ -14,6 +14,7 @@
 #include <fstream>
 #include <algorithm>
 #include <numeric>
+#include <limits>
 #include <cstdlib>
 #include <cuda.h>
 #include "cuda_runtime.h"
@@ -343,6 +344,7 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	obtain(chunk, geom.conic_opacity, P, 128);
 	obtain(chunk, geom.rgb, P * 3, 128);
 	obtain(chunk, geom.tiles_touched, P, 128);
+	geom.scan_size = 0;
 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
 	// The call above is a standard CUB pattern: passing nullptr asks CUB how much
 	// temporary storage the scan will need, without executing the scan yet.
@@ -367,26 +369,41 @@ CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chun
 	obtain(chunk, binning.point_list_unsorted, P, 128);
 	obtain(chunk, binning.point_list_keys, P, 128);
 	obtain(chunk, binning.point_list_keys_unsorted, P, 128);
-	cub::DeviceRadixSort::SortPairs(
-		nullptr, binning.sorting_size,
-		binning.point_list_keys_unsorted, binning.point_list_keys,
-		binning.point_list_unsorted, binning.point_list, P);
+	binning.sorting_size = 0;
+	if (P == 0)
+	{
+		binning.sorting_size = 0;
+	}
+	else
+	{
+		cub::DeviceRadixSort::SortPairs(
+			nullptr, binning.sorting_size,
+			binning.point_list_keys_unsorted, binning.point_list_keys,
+			binning.point_list_unsorted, binning.point_list, P);
+	}
 	// Same two-step pattern as above: query scratch size first, then allocate it.
 	obtain(chunk, binning.list_sorting_space, binning.sorting_size, 128);
 	return binning;
 }
 
-CudaRasterizer::GeometryStateBatch CudaRasterizer::GeometryStateBatch::fromChunk(char*& chunk, size_t P, size_t N)
+CudaRasterizer::GeometryStateBatch CudaRasterizer::GeometryStateBatch::fromChunk(char*& chunk, size_t P, size_t N, bool needs_sh_color)
 {
 	GeometryStateBatch geom;
 	obtain(chunk, geom.depths, P * N, 128);
-	obtain(chunk, geom.clamped, P * N * 3, 128);
+	if (needs_sh_color)
+		obtain(chunk, geom.clamped, P * N * 3, 128);
+	else
+		geom.clamped = nullptr;
 	obtain(chunk, geom.internal_radii, P * N, 128);
 	obtain(chunk, geom.means2D, P * N, 128);
-	obtain(chunk, geom.cov3D, P * N * 6, 128);
+	obtain(chunk, geom.cov3D, P * 6, 128);
 	obtain(chunk, geom.conic_opacity, P * N, 128);
-	obtain(chunk, geom.rgb, P * N * 3, 128);
+	if (needs_sh_color)
+		obtain(chunk, geom.rgb, P * N * 3, 128);
+	else
+		geom.rgb = nullptr;
 	obtain(chunk, geom.tiles_touched, P * N, 128);
+	geom.scan_size = 0;
 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P * N);
 	obtain(chunk, geom.scanning_space, geom.scan_size, 128);
 	obtain(chunk, geom.point_offsets, P * N, 128);
@@ -409,10 +426,18 @@ CudaRasterizer::BinningStateBatch CudaRasterizer::BinningStateBatch::fromChunk(c
 	obtain(chunk, binning.point_list_unsorted, max_rendered, 128);
 	obtain(chunk, binning.point_list_keys, max_rendered, 128);
 	obtain(chunk, binning.point_list_keys_unsorted, max_rendered, 128);
-	cub::DeviceRadixSort::SortPairs(
-		nullptr, binning.sorting_size,
-		binning.point_list_keys_unsorted, binning.point_list_keys,
-		binning.point_list_unsorted, binning.point_list, max_rendered);
+	binning.sorting_size = 0;
+	if (max_rendered == 0)
+	{
+		binning.sorting_size = 0;
+	}
+	else
+	{
+		cub::DeviceRadixSort::SortPairs(
+			nullptr, binning.sorting_size,
+			binning.point_list_keys_unsorted, binning.point_list_keys,
+			binning.point_list_unsorted, binning.point_list, max_rendered);
+	}
 	obtain(chunk, binning.list_sorting_space, binning.sorting_size, 128);
 	return binning;
 }
@@ -738,7 +763,13 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 	const int probe_debug = gs_preprocess_probe_enabled() ? 1 : 0;
 	
 	if (gs_batch_debug) {
-		std::cout << "[GS_BATCH_DEBUG] forwardBatch START: P=" << P << ", N=" << N << ", " << width << "x" << height << std::endl;
+		std::cout << "[GS_BATCH_DEBUG] forwardBatch START: P=" << P
+			<< ", N=" << N
+			<< ", image=" << width << "x" << height
+			<< ", render_color=" << (out_color != nullptr)
+			<< ", render_depth=" << (depth != nullptr)
+			<< ", return_radii=" << (radii != nullptr)
+			<< std::endl;
 	}
 
 	const float focal_y = height / (2.0f * tan_fovy);
@@ -749,9 +780,18 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 	// Here tile_grid.z stores the camera count. Downstream kernels use the third grid
 	// dimension to distinguish cameras while reusing the same 2D tile layout.
 
-	size_t geom_chunk_size = required<GeometryStateBatch>(P, N);
+	const bool render_color = out_color != nullptr;
+	const bool needs_sh_color = render_color && colors_precomp == nullptr;
+
+	size_t geom_chunk_size = required<GeometryStateBatch>(P, N, needs_sh_color);
+	if (gs_batch_debug) {
+		std::cout << "[GS_BATCH_DEBUG] tile_grid=" << tile_grid.x << "x" << tile_grid.y << "x" << tile_grid.z
+			<< ", block=" << block.x << "x" << block.y << "x" << block.z
+			<< ", needs_sh_color=" << needs_sh_color
+			<< ", geom_chunk_size=" << geom_chunk_size << std::endl;
+	}
 	char* geom_chunkptr = geometryBuffer(geom_chunk_size);
-	GeometryStateBatch geomState = GeometryStateBatch::fromChunk(geom_chunkptr, P, N);
+	GeometryStateBatch geomState = GeometryStateBatch::fromChunk(geom_chunkptr, P, N, needs_sh_color);
 
 	if (radii == nullptr)
 	{
@@ -759,10 +799,15 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 	}
 
 	size_t img_chunk_size = required<ImageStateBatch>(N, tile_grid.x * tile_grid.y, width * height);
+	if (gs_batch_debug) {
+		std::cout << "[GS_BATCH_DEBUG] img_chunk_size=" << img_chunk_size
+			<< ", tiles_per_camera=" << tile_grid.x * tile_grid.y
+			<< ", pixels_per_camera=" << width * height << std::endl;
+	}
 	char* img_chunkptr = imageBuffer(img_chunk_size);
 	ImageStateBatch imgState = ImageStateBatch::fromChunk(img_chunkptr, N, tile_grid.x * tile_grid.y, width * height);
 
-	if (NUM_CHANNELS != 3 && colors_precomp == nullptr)
+	if (render_color && NUM_CHANNELS != 3 && colors_precomp == nullptr)
 	{
 		throw std::runtime_error("For non-RGB, provide precomputed Gaussian colors!");
 	}
@@ -795,7 +840,8 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 		geomState.tiles_touched,
 		probe_debug,
 		prefiltered,
-		antialiasing
+		antialiasing,
+		render_color
 	), debug)
 	// preprocessBatch computes per-camera, per-Gaussian projected attributes.
 
@@ -839,8 +885,18 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P * N), debug)
 
 	// Retrieve actual number of rendered entries
-	int num_rendered;
-	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P * N - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+	uint32_t num_rendered_u32;
+	CHECK_CUDA(cudaMemcpy(&num_rendered_u32, geomState.point_offsets + P * N - 1, sizeof(uint32_t), cudaMemcpyDeviceToHost), debug);
+	const uint64_t max_rendered_possible = static_cast<uint64_t>(P) * static_cast<uint64_t>(N) * static_cast<uint64_t>(tile_grid.x) * static_cast<uint64_t>(tile_grid.y);
+	if (gs_batch_debug) {
+		std::cout << "[GS_BATCH_DEBUG] num_rendered_u32=" << num_rendered_u32
+			<< ", max_rendered_possible=" << max_rendered_possible << std::endl;
+	}
+	if (num_rendered_u32 > max_rendered_possible || num_rendered_u32 > static_cast<uint32_t>(std::numeric_limits<int>::max()))
+	{
+		throw std::runtime_error("Batch rasterizer produced an invalid tile-overlap count before binning allocation.");
+	}
+	int num_rendered = static_cast<int>(num_rendered_u32);
 	if (debug)
 		std::cout << "[Rasterizer::forwardBatch] P=" << P << ", N=" << N
 			<< ", image=" << width << "x" << height
@@ -857,8 +913,20 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 
 	size_t num_tiles_per_cam = tile_grid.x * tile_grid.y;
 
+	if (num_rendered == 0)
+	{
+		if (gs_batch_debug) {
+			std::cout << "[GS_BATCH_DEBUG] no tile overlaps; skipping binning, sorting, ranges, and renderBatch" << std::endl;
+			std::cout << "[GS_BATCH_DEBUG] forwardBatch END" << std::endl;
+		}
+		return 0;
+	}
+
 	// Allocate binning state with actual num_rendered
 	size_t binning_chunk_size = required<BinningStateBatch>(num_rendered);
+	if (gs_batch_debug) {
+		std::cout << "[GS_BATCH_DEBUG] binning_chunk_size=" << binning_chunk_size << std::endl;
+	}
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningStateBatch binningState = BinningStateBatch::fromChunk(binning_chunkptr, num_rendered);
 
@@ -962,8 +1030,13 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 
 	// STAGE 6: renderBatch
 	// Render all cameras
-	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
-	int feature_stride = colors_precomp != nullptr ? 0 : P * 3;
+	const float* feature_ptr = nullptr;
+	int feature_stride = -1;
+	if (render_color)
+	{
+		feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+		feature_stride = colors_precomp != nullptr ? 0 : P * 3;
+	}
 	CHECK_CUDA(FORWARD::renderBatch(
 		tile_grid, block,
 		imgState.ranges,
@@ -992,14 +1065,16 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 		
 		// Compute out_color nonzero counts per camera
 		int* out_color_nonzero_counts_host = new int[N]();
-		int *out_color_nonzero_counts;
-		cudaMalloc(&out_color_nonzero_counts, N * sizeof(int));
-		cudaMemset(out_color_nonzero_counts, 0, N * sizeof(int));
-		computeOutColorNonzeroCountKernel<<<(N * 3 * height * width + 255) / 256, 256>>>(
-			out_color, N, 3, height, width, out_color_nonzero_counts);
-		cudaDeviceSynchronize();
-		cudaMemcpy(out_color_nonzero_counts_host, out_color_nonzero_counts, N * sizeof(int), cudaMemcpyDeviceToHost);
-		cudaFree(out_color_nonzero_counts);
+		if (render_color) {
+			int *out_color_nonzero_counts;
+			cudaMalloc(&out_color_nonzero_counts, N * sizeof(int));
+			cudaMemset(out_color_nonzero_counts, 0, N * sizeof(int));
+			computeOutColorNonzeroCountKernel<<<(N * 3 * height * width + 255) / 256, 256>>>(
+				out_color, N, 3, height, width, out_color_nonzero_counts);
+			cudaDeviceSynchronize();
+			cudaMemcpy(out_color_nonzero_counts_host, out_color_nonzero_counts, N * sizeof(int), cudaMemcpyDeviceToHost);
+			cudaFree(out_color_nonzero_counts);
+		}
 		
 		// Print JSON for cam0/cam1
 		std::cout << "[GS_BATCH_DEBUG] JSON: {";

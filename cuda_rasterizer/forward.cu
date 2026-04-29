@@ -264,7 +264,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// the Gaussian in image space is then just a quadratic form.
 	const float det = det_cov_plus_h_cov;
 
-	if (det == 0.0f)
+	if (!isfinite(det) || det <= 0.0f)
 		return;
 	float det_inv = 1.f / det;
 	float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
@@ -280,6 +280,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
 	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
 	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
+	if (!isfinite(my_radius) || !isfinite(point_image.x) || !isfinite(point_image.y))
+		return;
 	// Convert NDC coordinates into pixel coordinates so later kernels can work in
 	// screen pixels and tiles directly.
 	uint2 rect_min, rect_max;
@@ -566,6 +568,19 @@ void FORWARD::preprocess(int P, int D, int M,
 }
 
 template<int C>
+__global__ void precomputeCov3DBatch(
+	int P,
+	const glm::vec3* scales,
+	const float scale_modifier,
+	const glm::vec4* rotations,
+	float* cov3Ds)
+{
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= P) return;
+	computeCov3D(scales[idx], scale_modifier, rotations[idx], cov3Ds + idx * 6);
+}
+
+template<int C>
 __global__ void preprocessCUDABatch(int P, int D, int M, int N,
 	const float* orig_points,
 	const glm::vec3* scales,
@@ -592,7 +607,8 @@ __global__ void preprocessCUDABatch(int P, int D, int M, int N,
 	uint32_t* tiles_touched,
 	int probe_debug,
 	bool prefiltered,
-	bool antialiasing)
+	bool antialiasing,
+	bool render_color)
 {
 	// Batched preprocess flattens the logical 2D problem:
 	// row = camera, column = Gaussian, linear index = camera * P + Gaussian.
@@ -633,11 +649,7 @@ __global__ void preprocessCUDABatch(int P, int D, int M, int N,
 	}
 	else
 	{
-		float* cov3D_slot = cov3Ds + (cam_id * P + gaussian_id) * 6;
-		// Even though the 3D covariance is camera-independent, the batched code stores
-		// it per (camera, Gaussian) so all later accesses stay in a simple flattened layout.
-		computeCov3D(scales[gaussian_id], scale_modifier, rotations[gaussian_id], cov3D_slot);
-		cov3D = cov3D_slot;
+		cov3D = cov3Ds + gaussian_id * 6;
 	}
 
 	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
@@ -652,7 +664,7 @@ __global__ void preprocessCUDABatch(int P, int D, int M, int N,
 		h_convolution_scaling = sqrt(max(0.000025f, det_cov / det_cov_plus_h_cov));
 
 	const float det = det_cov_plus_h_cov;
-	if (det == 0.0f) return;
+	if (!isfinite(det) || det <= 0.0f) return;
 	float det_inv = 1.f / det;
 	float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
 
@@ -661,11 +673,13 @@ __global__ void preprocessCUDABatch(int P, int D, int M, int N,
 	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
 	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
 	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
+	if (!isfinite(my_radius) || !isfinite(point_image.x) || !isfinite(point_image.y))
+		return;
 	uint2 rect_min, rect_max;
 	getRect(point_image, my_radius, rect_min, rect_max, grid);
 	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0) return;
 
-	if (colors_precomp == nullptr)
+	if (render_color && colors_precomp == nullptr)
 	{
 		glm::vec3 result = computeColorFromSH(gaussian_id, D, M, (glm::vec3*)orig_points, cam_pos, shs, clamped + cam_id * P * 3);
 		float* rgb_slot = rgb + (cam_id * P + gaussian_id) * C;
@@ -712,9 +726,19 @@ void FORWARD::preprocessBatch(int P, int D, int M, int N,
 	uint32_t* tiles_touched,
 	int probe_debug,
 	bool prefiltered,
-	bool antialiasing)
+	bool antialiasing,
+	bool render_color)
 {
 	int total = P * N;
+	if (cov3D_precomp == nullptr)
+	{
+		precomputeCov3DBatch<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
+			P,
+			scales,
+			scale_modifier,
+			rotations,
+			cov3Ds);
+	}
 	// Launch one GPU thread for each (camera, Gaussian) pair.
 	preprocessCUDABatch<NUM_CHANNELS> << <(total + 255) / 256, 256 >> > (
 		P, D, M, N,
@@ -743,7 +767,8 @@ void FORWARD::preprocessBatch(int P, int D, int M, int N,
 		tiles_touched,
 		probe_debug,
 		prefiltered,
-		antialiasing);
+		antialiasing,
+		render_color);
 }
 
 template <uint32_t CHANNELS>
@@ -799,6 +824,7 @@ renderCUDABatch(
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
 	float expected_invdepth = 0.0f;
+	bool render_color = out_color != nullptr;
 
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
 	{
@@ -829,11 +855,14 @@ renderCUDABatch(
 			float test_T = T * (1 - alpha);
 			if (test_T < 0.0001f) { done = true; continue; }
 
-			int feat_base = (feature_stride == 0 ? collected_id[j] * CHANNELS : cam_id * feature_stride + collected_id[j] * CHANNELS);
-			// feature_stride distinguishes two memory layouts:
-			// 1) precomputed colors shared by all cameras (stride 0)
-			// 2) per-camera colors generated during preprocessBatch (non-zero stride)
-			for (int ch = 0; ch < CHANNELS; ch++) C[ch] += features[feat_base + ch] * alpha * T;
+			if (render_color)
+			{
+				int feat_base = (feature_stride == 0 ? collected_id[j] * CHANNELS : cam_id * feature_stride + collected_id[j] * CHANNELS);
+				// feature_stride distinguishes two memory layouts:
+				// 1) precomputed colors shared by all cameras (stride 0)
+				// 2) per-camera colors generated during preprocessBatch (non-zero stride)
+				for (int ch = 0; ch < CHANNELS; ch++) C[ch] += features[feat_base + ch] * alpha * T;
+			}
 			if (invdepth) expected_invdepth += (1.0f / cam_depths[collected_id[j]]) * alpha * T;
 			T = test_T;
 			last_contributor = contributor;
@@ -845,8 +874,9 @@ renderCUDABatch(
 		// Batched outputs are camera-major: all data for camera 0, then camera 1, etc.
 		final_T[cam_id * H * W + pix_id] = T;
 		n_contrib[cam_id * H * W + pix_id] = last_contributor;
-		for (int ch = 0; ch < CHANNELS; ch++)
-			out_color[(cam_id * CHANNELS + ch) * H * W + pix_id] = C[ch] + T * bg_color[ch];
+		if (render_color)
+			for (int ch = 0; ch < CHANNELS; ch++)
+				out_color[(cam_id * CHANNELS + ch) * H * W + pix_id] = C[ch] + T * bg_color[ch];
 		if (invdepth) invdepth[cam_id * H * W + pix_id] = expected_invdepth;
 	}
 }
