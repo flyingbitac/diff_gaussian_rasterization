@@ -46,6 +46,25 @@ static bool gs_batch_debug_enabled() {
     return env && atoi(env) == 1;
 }
 
+static bool gs_batch_profile_enabled() {
+    const char* env = std::getenv("GS_BATCH_PROFILE");
+    return env && atoi(env) == 1;
+}
+
+static int bitsNeeded(uint64_t count)
+{
+	if (count <= 1)
+		return 0;
+	count -= 1;
+	int bits = 0;
+	while (count > 0)
+	{
+		bits++;
+		count >>= 1;
+	}
+	return bits;
+}
+
 __global__ void computeRadiiPosCountKernel(int* radii, int P, int N, int* out_counts) {
     // __global__ means "this function runs on the GPU and is launched from the CPU".
     // Every GPU thread computes one linear index into the flattened (N, P) array.
@@ -182,9 +201,8 @@ __global__ void duplicateWithKeys(
 }
 
 // Batch version: each Gaussian projects to each camera, generating P*N tile entries.
-// Key format: | camera_id (16 bits) | tile_id (16 bits) | depth (32 bits) |
-// This ensures all entries for camera 0 come first (sorted by tile, then depth),
-// then all entries for camera 1, etc.
+// Key format: | global_tile_id (32 bits) | depth (32 bits) | where
+// global_tile_id = camera_id * tiles_per_camera + tile_id.
 __global__ void duplicateWithKeysBatch(
 	int P,
 	int N,
@@ -224,24 +242,16 @@ __global__ void duplicateWithKeysBatch(
 		getRect(cam_points_xy[gaussian_id], cam_radii[gaussian_id], rect_min, rect_max, grid);
 
 		// For each tile that the bounding rect overlaps, emit a 
-		// key/value pair. The key is:
-		// | camera_id (16 bits) | tile_id (16 bits) | depth (32 bits) |
-		// Sorting with this key yields Gaussian IDs sorted first by camera,
-		// then by tile, then by depth.
+		// key/value pair. Sorting with this key yields Gaussian IDs sorted first by
+		// camera/tile group, then by depth.
+		const uint32_t tiles_per_camera = grid.x * grid.y;
 		for (int y = rect_min.y; y < rect_max.y; y++)
 		{
 			for (int x = rect_min.x; x < rect_max.x; x++)
 			{
-				uint64_t key = 0;
-				
-				// Manually pack several sort fields into one integer key:
-				// camera in the top 16 bits, tile in the next 16 bits, depth in the
-				// low 32 bits.
-				key |= ((uint64_t)cam_id & 0xFFFF) << 48;
-				
 				uint32_t tile_id = y * grid.x + x;
-				key |= ((uint64_t)tile_id & 0xFFFF) << 32;
-				
+				uint32_t global_tile_id = cam_id * tiles_per_camera + tile_id;
+				uint64_t key = ((uint64_t)global_tile_id) << 32;
 				key |= *((uint32_t*)&cam_depths[gaussian_id]);
 				
 				gaussian_keys_unsorted[off] = key;
@@ -281,9 +291,9 @@ __global__ void identifyTileRanges(int L, uint64_t* point_list_keys, uint2* rang
 		ranges[currtile].y = L;
 }
 
-// Batch version: handles keys with format | camera_id (16b) | tile_id (16b) | depth (32b) |
-// ranges is 2D: ranges[camera_id * tile_count + tile_id]
-__global__ void identifyTileRangesBatch(int L, int num_cameras, int tile_count, uint64_t* point_list_keys, uint2* ranges)
+// Batch version: handles keys with format | global_tile_id (32b) | depth (32b) |
+// ranges is 2D: ranges[camera_id * tile_count + tile_id].
+__global__ void identifyTileRangesBatch(int L, uint64_t* point_list_keys, uint2* ranges)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= L)
@@ -291,18 +301,14 @@ __global__ void identifyTileRangesBatch(int L, int num_cameras, int tile_count, 
 
 	// Decode the packed sort key produced in duplicateWithKeysBatch.
 	uint64_t key = point_list_keys[idx];
-	uint32_t curr_camera = (key >> 48) & 0xFFFF;  // upper 16 bits
-	uint32_t curr_tile = (key >> 32) & 0xFFFF;    // middle 16 bits
-	uint32_t curr_idx = curr_camera * tile_count + curr_tile;
+	uint32_t curr_idx = key >> 32;
 	
 	if (idx == 0)
 		ranges[curr_idx].x = 0;
 	else
 	{
 		uint64_t prev_key = point_list_keys[idx - 1];
-		uint32_t prev_camera = (prev_key >> 48) & 0xFFFF;
-		uint32_t prev_tile = (prev_key >> 32) & 0xFFFF;
-		uint32_t prev_idx = prev_camera * tile_count + prev_tile;
+		uint32_t prev_idx = prev_key >> 32;
 		
 		if (curr_idx != prev_idx)
 		{
@@ -760,7 +766,36 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 	// pipeline once per camera, it flattens (camera, Gaussian) work into shared GPU
 	// buffers and processes all cameras in one pass.
 	const bool gs_batch_debug = gs_batch_debug_enabled();
+	const bool gs_batch_profile = gs_batch_profile_enabled();
 	const int probe_debug = gs_preprocess_probe_enabled() ? 1 : 0;
+	cudaEvent_t profile_start, profile_preprocess_done, profile_scan_done, profile_duplicate_done;
+	cudaEvent_t profile_sort_done, profile_range_done, profile_render_done;
+	if (gs_batch_profile)
+	{
+		cudaEventCreate(&profile_start);
+		cudaEventCreate(&profile_preprocess_done);
+		cudaEventCreate(&profile_scan_done);
+		cudaEventCreate(&profile_duplicate_done);
+		cudaEventCreate(&profile_sort_done);
+		cudaEventCreate(&profile_range_done);
+		cudaEventCreate(&profile_render_done);
+		cudaEventRecord(profile_start);
+	}
+	auto destroy_profile_events = [&]() {
+		if (!gs_batch_profile) return;
+		cudaEventDestroy(profile_start);
+		cudaEventDestroy(profile_preprocess_done);
+		cudaEventDestroy(profile_scan_done);
+		cudaEventDestroy(profile_duplicate_done);
+		cudaEventDestroy(profile_sort_done);
+		cudaEventDestroy(profile_range_done);
+		cudaEventDestroy(profile_render_done);
+	};
+	auto elapsed_ms = [](cudaEvent_t start, cudaEvent_t end) {
+		float ms = 0.0f;
+		cudaEventElapsedTime(&ms, start, end);
+		return ms;
+	};
 	
 	if (gs_batch_debug) {
 		std::cout << "[GS_BATCH_DEBUG] forwardBatch START: P=" << P
@@ -844,6 +879,7 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 		render_color
 	), debug)
 	// preprocessBatch computes per-camera, per-Gaussian projected attributes.
+	if (gs_batch_profile) cudaEventRecord(profile_preprocess_done);
 
 	if (gs_batch_debug) {
 		auto ret = cudaDeviceSynchronize();
@@ -883,6 +919,7 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 	// Compute prefix sum over full list of touched tile counts per (camera, gaussian)
 	// This must be done BEFORE duplicateWithKeysBatch to initialize point_offsets
 	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P * N), debug)
+	if (gs_batch_profile) cudaEventRecord(profile_scan_done);
 
 	// Retrieve actual number of rendered entries
 	uint32_t num_rendered_u32;
@@ -912,6 +949,14 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 	}
 
 	size_t num_tiles_per_cam = tile_grid.x * tile_grid.y;
+	const uint64_t total_tile_groups = static_cast<uint64_t>(N) * static_cast<uint64_t>(num_tiles_per_cam);
+	if (total_tile_groups > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()))
+	{
+		destroy_profile_events();
+		throw std::runtime_error("Batch rasterizer has too many camera/tile groups for the packed sort key.");
+	}
+	const int tile_group_bits = bitsNeeded(total_tile_groups);
+	const int sort_end_bit = std::min(64, 32 + tile_group_bits);
 
 	if (num_rendered == 0)
 	{
@@ -919,6 +964,21 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 			std::cout << "[GS_BATCH_DEBUG] no tile overlaps; skipping binning, sorting, ranges, and renderBatch" << std::endl;
 			std::cout << "[GS_BATCH_DEBUG] forwardBatch END" << std::endl;
 		}
+		if (gs_batch_profile)
+		{
+			cudaEventSynchronize(profile_scan_done);
+			std::cout << "[GS_BATCH_PROFILE] {\"P\":" << P
+				<< ",\"N\":" << N
+				<< ",\"image\":\"" << width << "x" << height << "\""
+				<< ",\"num_rendered\":0"
+				<< ",\"sort_end_bit\":" << sort_end_bit
+				<< ",\"stage_ms\":{\"preprocess\":" << elapsed_ms(profile_start, profile_preprocess_done)
+				<< ",\"scan\":" << elapsed_ms(profile_preprocess_done, profile_scan_done)
+				<< ",\"duplicate\":0,\"sort\":0,\"range\":0,\"render\":0"
+				<< ",\"gpu_total\":" << elapsed_ms(profile_start, profile_scan_done)
+				<< "}}" << std::endl;
+		}
+		destroy_profile_events();
 		return 0;
 	}
 
@@ -951,20 +1011,21 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 		}
 		std::cout << "[GS_BATCH_DEBUG] STAGE 3 duplicateWithKeysBatch PASSED" << std::endl;
 	}
+	if (gs_batch_profile) cudaEventRecord(profile_duplicate_done);
 
 	// STAGE 4: sort
 	// The packed key includes camera and tile information, so a single global sort
 	// groups records by camera first, then by tile, then by depth.
-	int bit = getHigherMsb(tile_grid.x * tile_grid.y) + 16;  // +16 for camera_id bits
-
 	// Sort by keys using actual num_rendered
 	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
 		binningState.list_sorting_space,
 		binningState.sorting_size,
 		binningState.point_list_keys_unsorted, binningState.point_list_keys,
 		binningState.point_list_unsorted, binningState.point_list,
-		num_rendered, 0, 64), debug)
-	// The code sorts the full 64-bit key range for simplicity.
+		num_rendered, 0, sort_end_bit), debug)
+	// Only sort the key bits that can vary: 32 depth bits plus enough high bits
+	// for all camera/tile groups.
+	if (gs_batch_profile) cudaEventRecord(profile_sort_done);
 
 	if (gs_batch_debug) {
 		auto ret = cudaDeviceSynchronize();
@@ -998,12 +1059,11 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 	if (num_rendered > 0)
 		identifyTileRangesBatch << <(num_rendered + 255) / 256, 256 >> > (
 			num_rendered,
-			N,
-			num_tiles_per_cam,
 			binningState.point_list_keys,
 			imgState.ranges);
 	CHECK_CUDA(cudaGetLastError(), debug)
 	// imgState.ranges is indexed as [camera * tiles_per_camera + tile].
+	if (gs_batch_profile) cudaEventRecord(profile_range_done);
 
 	if (gs_batch_debug) {
 		auto ret = cudaDeviceSynchronize();
@@ -1054,6 +1114,7 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 		feature_stride), debug)
 	// renderBatch consumes the per-(camera, tile) ranges and writes all camera images
 	// into one flattened output buffer.
+	if (gs_batch_profile) cudaEventRecord(profile_render_done);
 
 	if (gs_batch_debug) {
 		auto ret = cudaDeviceSynchronize();
@@ -1117,5 +1178,23 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 		std::cout << "[GS_BATCH_DEBUG] forwardBatch END" << std::endl;
 	}
 
+	if (gs_batch_profile)
+	{
+		cudaEventSynchronize(profile_render_done);
+		std::cout << "[GS_BATCH_PROFILE] {\"P\":" << P
+			<< ",\"N\":" << N
+			<< ",\"image\":\"" << width << "x" << height << "\""
+			<< ",\"num_rendered\":" << num_rendered
+			<< ",\"sort_end_bit\":" << sort_end_bit
+			<< ",\"stage_ms\":{\"preprocess\":" << elapsed_ms(profile_start, profile_preprocess_done)
+			<< ",\"scan\":" << elapsed_ms(profile_preprocess_done, profile_scan_done)
+			<< ",\"duplicate\":" << elapsed_ms(profile_scan_done, profile_duplicate_done)
+			<< ",\"sort\":" << elapsed_ms(profile_duplicate_done, profile_sort_done)
+			<< ",\"range\":" << elapsed_ms(profile_sort_done, profile_range_done)
+			<< ",\"render\":" << elapsed_ms(profile_range_done, profile_render_done)
+			<< ",\"gpu_total\":" << elapsed_ms(profile_start, profile_render_done)
+			<< "}}" << std::endl;
+	}
+	destroy_profile_events();
 	return num_rendered;
 }
