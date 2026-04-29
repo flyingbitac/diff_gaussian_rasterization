@@ -45,7 +45,6 @@ namespace FORWARD
 		float4* conic_opacity,
 		const dim3 grid,
 		uint32_t* tiles_touched,
-		int probe_debug,
 		bool prefiltered,
 		bool antialiasing);
 
@@ -74,7 +73,6 @@ namespace FORWARD
 		float4* conic_opacity,     // (N, P)
 		const dim3 grid,
 		uint32_t* tiles_touched,   // (N, P)
-		int probe_debug,
 		bool prefiltered,
 		bool antialiasing,
 		bool render_color);

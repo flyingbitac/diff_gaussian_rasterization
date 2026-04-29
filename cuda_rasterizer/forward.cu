@@ -164,12 +164,6 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 	cov3D[5] = Sigma[2][2];
 }
 
-__device__ __forceinline__ bool isProbeGaussian(int id)
-{
-	// Tiny debug helper: only a small set of hard-coded ids emit printf logs.
-	return id == 0 || id == 1 || id == 2 || id == 1024 || id == 65536 || id == 262144 || id == 524288 || id == 1048576 || id == 1500000 || id == 1999999;
-}
-
 // Perform initial steps for each Gaussian prior to rasterization.
 template<int C>
 __global__ void preprocessCUDA(int P, int D, int M,
@@ -196,7 +190,6 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float4* conic_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	int probe_debug,
 	bool prefiltered,
 	bool antialiasing)
 {
@@ -217,8 +210,6 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// work is needed for this Gaussian.
 	float3 p_view;
 	bool in_view = in_frustum(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view);
-	if (probe_debug && isProbeGaussian(idx))
-		printf("[PPROBE][SER] gid=%d in=%d pview=(%f,%f,%f)\n", (int)idx, (int)in_view, (double)p_view.x, (double)p_view.y, (double)p_view.z);
 	if (!in_view)
 		return;
 
@@ -318,8 +309,6 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 	// tiles_touched is later prefix-scanned so each Gaussian can reserve exactly
 	// enough slots in the duplicated point list.
-	if (probe_debug && isProbeGaussian(idx))
-		printf("[PPROBE][SER] gid=%d radius=%d tiles=%u det=%f cov=(%f,%f,%f)\n", (int)idx, (int)my_radius, (unsigned)tiles_touched[idx], (double)det, (double)cov.x, (double)cov.y, (double)cov.z);
 }
 
 // Main rasterization method. Collaboratively works on one tile per
@@ -531,7 +520,6 @@ void FORWARD::preprocess(int P, int D, int M,
 	float4* conic_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	int probe_debug,
 	bool prefiltered,
 	bool antialiasing)
 {
@@ -561,7 +549,6 @@ void FORWARD::preprocess(int P, int D, int M,
 		conic_opacity,
 		grid,
 		tiles_touched,
-		probe_debug,
 		prefiltered,
 		antialiasing
 		);
@@ -605,7 +592,6 @@ __global__ void preprocessCUDABatch(int P, int D, int M, int N,
 	float4* conic_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	int probe_debug,
 	bool prefiltered,
 	bool antialiasing,
 	bool render_color)
@@ -631,8 +617,6 @@ __global__ void preprocessCUDABatch(int P, int D, int M, int N,
 
 	float3 p_view;
 	bool in_view = in_frustum(gaussian_id, orig_points, viewmatrix, projmatrix, prefiltered, p_view);
-	if (probe_debug && cam_id == 0 && isProbeGaussian(gaussian_id))
-		printf("[PPROBE][BAT] gid=%d in=%d pview=(%f,%f,%f)\n", (int)gaussian_id, (int)in_view, (double)p_view.x, (double)p_view.y, (double)p_view.z);
 	if (!in_view)
 		return;
 	// From here down, the math mirrors the single-camera preprocess kernel; the
@@ -696,8 +680,6 @@ __global__ void preprocessCUDABatch(int P, int D, int M, int N,
 	float opacity = opacities[gaussian_id];
 	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacity * h_convolution_scaling };
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
-	if (probe_debug && cam_id == 0 && isProbeGaussian(gaussian_id))
-		printf("[PPROBE][PRO] gid=%d radius=%d tiles=%u det=%f cov=(%f,%f,%f)\n", (int)gaussian_id, (int)my_radius, (unsigned)tiles_touched[idx], (double)det, (double)cov.x, (double)cov.y, (double)cov.z);
 }
 
 void FORWARD::preprocessBatch(int P, int D, int M, int N,
@@ -724,7 +706,6 @@ void FORWARD::preprocessBatch(int P, int D, int M, int N,
 	float4* conic_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	int probe_debug,
 	bool prefiltered,
 	bool antialiasing,
 	bool render_color)
@@ -765,7 +746,6 @@ void FORWARD::preprocessBatch(int P, int D, int M, int N,
 		conic_opacity,
 		grid,
 		tiles_touched,
-		probe_debug,
 		prefiltered,
 		antialiasing,
 		render_color);

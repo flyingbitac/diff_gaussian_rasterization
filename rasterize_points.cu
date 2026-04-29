@@ -12,7 +12,6 @@
 #include <math.h>
 #include <torch/extension.h>
 #include <cstdio>
-#include <cstdlib>
 #include <sstream>
 #include <iostream>
 #include <tuple>
@@ -26,17 +25,9 @@
 #include <string>
 #include <functional>
 
-static bool gs_batch_debug_enabled_cpp() {
-    const char* env = std::getenv("GS_BATCH_DEBUG");
-    return env && atoi(env) == 1;
-}
-
 std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t, const char* name = "buffer") {
     auto lambda = [&t, name](size_t N) {
         constexpr size_t kMaxReasonableBufferBytes = size_t(1) << 40;
-        if (gs_batch_debug_enabled_cpp()) {
-            std::cout << "[GS_BATCH_DEBUG] resize " << name << " bytes=" << N << std::endl;
-        }
         if (N > kMaxReasonableBufferBytes) {
             std::ostringstream oss;
             oss << "Refusing to allocate " << N << " bytes for CUDA rasterizer " << name << "; "
@@ -299,7 +290,6 @@ RasterizeGaussiansBatchKernelCUDAImpl(
   const int P = means3D.size(0);
   const int H = image_height;
   const int W = image_width;
-  const bool gs_debug = gs_batch_debug_enabled_cpp();
 
   // Validate batch tensor shapes
   if (viewmatrix.size(1) != 4 || viewmatrix.size(2) != 4) {
@@ -313,15 +303,6 @@ RasterizeGaussiansBatchKernelCUDAImpl(
   }
   if (N <= 0 || H <= 0 || W <= 0) {
     AT_ERROR("Batch rasterization expects positive N, image_height, and image_width.");
-  }
-  if (gs_debug) {
-    std::cout << "[GS_BATCH_DEBUG] compact wrapper: P=" << P
-              << ", N=" << N
-              << ", image=" << W << "x" << H
-              << ", render_color=" << render_color
-              << ", render_depth=" << render_depth
-              << ", return_radii=" << return_radii
-              << std::endl;
   }
 
   auto int_opts = means3D.options().dtype(torch::kInt32);
@@ -383,13 +364,6 @@ RasterizeGaussiansBatchKernelCUDAImpl(
   if (sh.size(0) != 0) {
     M = sh.size(1);
   }
-  if (gs_debug) {
-    std::cout << "[GS_BATCH_DEBUG] compact inputs: M=" << M
-              << ", sh_numel=" << sh_c.numel()
-              << ", colors_numel=" << colors_c.numel()
-              << ", cov_numel=" << cov3D_precomp_c.numel()
-              << std::endl;
-  }
 
   // Call the batch forward kernel
   std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer, "geomBuffer");
@@ -427,7 +401,7 @@ RasterizeGaussiansBatchKernelCUDAImpl(
       debug);
   }
 
-  if (debug || gs_debug) {
+  if (debug) {
     auto err = cudaGetLastError();
     if (err != cudaSuccess) AT_ERROR("forwardBatch launch failed: ", cudaGetErrorString(err));
     err = cudaDeviceSynchronize();

@@ -10,7 +10,6 @@
 #
 
 from typing import NamedTuple
-import os
 import torch.nn as nn
 import torch
 from . import _C
@@ -347,18 +346,6 @@ class GaussianRasterizer(nn.Module):
             rotations = torch.empty((means3D.shape[0], 4), dtype=torch.float32, device=device)
         if cov3D_precomp is None or cov3D_precomp.numel() == 0:
             cov3D_precomp = torch.empty((0,), dtype=torch.float32, device=device)
-
-        if os.environ.get("GS_BATCH_DEBUG") == "1":
-            print(
-                "[GS_BATCH_DEBUG] python compact: "
-                f"_C={getattr(_C, '__file__', '<unknown>')}, "
-                f"P={means3D.shape[0]}, N={raster_settings.viewmatrix.shape[0]}, "
-                f"image={raster_settings.image_width}x{raster_settings.image_height}, "
-                f"render_color={render_color}, render_depth={render_depth}, "
-                f"return_radii={return_radii}, sh_numel={shs.numel()}, "
-                f"colors_numel={colors_precomp.numel()}, cov_numel={cov3D_precomp.numel()}",
-                flush=True,
-            )
 
         _, color, radii, _, _, _, invdepths = _C.rasterize_gaussians_batch_kernel_compact(
             raster_settings.bg,

@@ -15,7 +15,6 @@
 #include <algorithm>
 #include <numeric>
 #include <limits>
-#include <cstdlib>
 #include <cuda.h>
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
@@ -32,25 +31,6 @@ namespace cg = cooperative_groups;
 #include "forward.h"
 #include "backward.h"
 
-static bool gs_preprocess_probe_enabled() {
-	// Read a process environment variable once per call. This is CPU-side code:
-	// it decides whether extra debug instrumentation should be enabled before
-	// any GPU kernel is launched.
-	const char* env = std::getenv("GS_PREPROCESS_PROBE");
-	return env && env[0] == '1';
-}
-
-static bool gs_batch_debug_enabled() {
-    // Same idea as above, but for the batched rendering path.
-    const char* env = std::getenv("GS_BATCH_DEBUG");
-    return env && atoi(env) == 1;
-}
-
-static bool gs_batch_profile_enabled() {
-    const char* env = std::getenv("GS_BATCH_PROFILE");
-    return env && atoi(env) == 1;
-}
-
 static int bitsNeeded(uint64_t count)
 {
 	if (count <= 1)
@@ -63,49 +43,6 @@ static int bitsNeeded(uint64_t count)
 		count >>= 1;
 	}
 	return bits;
-}
-
-__global__ void computeRadiiPosCountKernel(int* radii, int P, int N, int* out_counts) {
-    // __global__ means "this function runs on the GPU and is launched from the CPU".
-    // Every GPU thread computes one linear index into the flattened (N, P) array.
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= P * N) return;
-    if (radii[idx] > 0) {
-        // Multiple threads may update the same camera counter concurrently, so this
-        // must be atomic to avoid lost increments.
-        atomicAdd(&out_counts[idx / P], 1);
-    }
-}
-
-__global__ void computeTilesTouchedSumKernel(uint32_t* tiles_touched, int P, int N, uint32_t* out_sums) {
-    // Sum "tiles touched" per camera over a flattened (N, P) layout.
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= P * N) return;
-    atomicAdd(&out_sums[idx / P], tiles_touched[idx]);
-}
-
-__global__ void computeRangesValidCountKernel(uint2* ranges, int N, int tile_count, int* out_valid, int* out_oob) {
-    // Debug helper: each uint2 stores [start, end) for one tile's workload.
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N * tile_count) return;
-    uint2 range = ranges[idx];
-    if (range.x < range.y) {
-        atomicAdd(out_valid, 1);
-    } else if (range.x > range.y || (range.x == 0 && range.y == 0)) {
-    } else {
-        atomicAdd(out_oob, 1);
-    }
-}
-
-__global__ void computeOutColorNonzeroCountKernel(float* out_color, int N, int C, int H, int W, int* out_counts) {
-    // Count how many output pixels/channels are non-zero per camera.
-    // The output tensor is flattened as (N, C, H, W).
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N * C * H * W) return;
-    int cam_id = idx / (C * H * W);
-    if (out_color[idx] != 0.0f) {
-        atomicAdd(&out_counts[cam_id], 1);
-    }
 }
 
 // Helper function to find the next-highest bit of the MSB
@@ -508,7 +445,6 @@ int CudaRasterizer::Rasterizer::forward(
 	}
 
 	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
-	const int probe_debug = gs_preprocess_probe_enabled() ? 1 : 0;
 	CHECK_CUDA(FORWARD::preprocess(
 		P, D, M,
 		means3D,
@@ -533,7 +469,6 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.conic_opacity,
 		tile_grid,
 		geomState.tiles_touched,
-		probe_debug,
 		prefiltered,
 		antialiasing
 	), debug)
@@ -762,69 +697,16 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 	int* radii,
 	bool debug)
 {
-	// forwardBatch is the batched analogue of forward: instead of launching the whole
-	// pipeline once per camera, it flattens (camera, Gaussian) work into shared GPU
-	// buffers and processes all cameras in one pass.
-	const bool gs_batch_debug = gs_batch_debug_enabled();
-	const bool gs_batch_profile = gs_batch_profile_enabled();
-	const int probe_debug = gs_preprocess_probe_enabled() ? 1 : 0;
-	cudaEvent_t profile_start, profile_preprocess_done, profile_scan_done, profile_duplicate_done;
-	cudaEvent_t profile_sort_done, profile_range_done, profile_render_done;
-	if (gs_batch_profile)
-	{
-		cudaEventCreate(&profile_start);
-		cudaEventCreate(&profile_preprocess_done);
-		cudaEventCreate(&profile_scan_done);
-		cudaEventCreate(&profile_duplicate_done);
-		cudaEventCreate(&profile_sort_done);
-		cudaEventCreate(&profile_range_done);
-		cudaEventCreate(&profile_render_done);
-		cudaEventRecord(profile_start);
-	}
-	auto destroy_profile_events = [&]() {
-		if (!gs_batch_profile) return;
-		cudaEventDestroy(profile_start);
-		cudaEventDestroy(profile_preprocess_done);
-		cudaEventDestroy(profile_scan_done);
-		cudaEventDestroy(profile_duplicate_done);
-		cudaEventDestroy(profile_sort_done);
-		cudaEventDestroy(profile_range_done);
-		cudaEventDestroy(profile_render_done);
-	};
-	auto elapsed_ms = [](cudaEvent_t start, cudaEvent_t end) {
-		float ms = 0.0f;
-		cudaEventElapsedTime(&ms, start, end);
-		return ms;
-	};
-	
-	if (gs_batch_debug) {
-		std::cout << "[GS_BATCH_DEBUG] forwardBatch START: P=" << P
-			<< ", N=" << N
-			<< ", image=" << width << "x" << height
-			<< ", render_color=" << (out_color != nullptr)
-			<< ", render_depth=" << (depth != nullptr)
-			<< ", return_radii=" << (radii != nullptr)
-			<< std::endl;
-	}
-
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
 	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, N);
 	dim3 block(BLOCK_X, BLOCK_Y, 1);
-	// Here tile_grid.z stores the camera count. Downstream kernels use the third grid
-	// dimension to distinguish cameras while reusing the same 2D tile layout.
 
 	const bool render_color = out_color != nullptr;
 	const bool needs_sh_color = render_color && colors_precomp == nullptr;
 
 	size_t geom_chunk_size = required<GeometryStateBatch>(P, N, needs_sh_color);
-	if (gs_batch_debug) {
-		std::cout << "[GS_BATCH_DEBUG] tile_grid=" << tile_grid.x << "x" << tile_grid.y << "x" << tile_grid.z
-			<< ", block=" << block.x << "x" << block.y << "x" << block.z
-			<< ", needs_sh_color=" << needs_sh_color
-			<< ", geom_chunk_size=" << geom_chunk_size << std::endl;
-	}
 	char* geom_chunkptr = geometryBuffer(geom_chunk_size);
 	GeometryStateBatch geomState = GeometryStateBatch::fromChunk(geom_chunkptr, P, N, needs_sh_color);
 
@@ -834,11 +716,6 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 	}
 
 	size_t img_chunk_size = required<ImageStateBatch>(N, tile_grid.x * tile_grid.y, width * height);
-	if (gs_batch_debug) {
-		std::cout << "[GS_BATCH_DEBUG] img_chunk_size=" << img_chunk_size
-			<< ", tiles_per_camera=" << tile_grid.x * tile_grid.y
-			<< ", pixels_per_camera=" << width * height << std::endl;
-	}
 	char* img_chunkptr = imageBuffer(img_chunk_size);
 	ImageStateBatch imgState = ImageStateBatch::fromChunk(img_chunkptr, N, tile_grid.x * tile_grid.y, width * height);
 
@@ -847,7 +724,6 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 		throw std::runtime_error("For non-RGB, provide precomputed Gaussian colors!");
 	}
 
-	// STAGE 1: preprocessBatch
 	CHECK_CUDA(FORWARD::preprocessBatch(
 		P, D, M, N,
 		means3D,
@@ -873,62 +749,16 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 		geomState.conic_opacity,
 		tile_grid,
 		geomState.tiles_touched,
-		probe_debug,
 		prefiltered,
 		antialiasing,
 		render_color
 	), debug)
-	// preprocessBatch computes per-camera, per-Gaussian projected attributes.
-	if (gs_batch_profile) cudaEventRecord(profile_preprocess_done);
 
-	if (gs_batch_debug) {
-		auto ret = cudaDeviceSynchronize();
-		if (ret != cudaSuccess) {
-			std::cerr << "\n[GS_BATCH_DEBUG] STAGE 1 preprocessBatch CUDA ERROR: " << cudaGetErrorString(ret) << std::endl;
-			throw std::runtime_error(cudaGetErrorString(ret));
-		}
-		std::cout << "[GS_BATCH_DEBUG] STAGE 1 preprocessBatch PASSED" << std::endl;
-		
-		// Compute counters after preprocessBatch
-		int* radii_pos_counts_host = new int[N]();
-		uint32_t* tiles_touched_sums_host = new uint32_t[N]();
-		int *radii_pos_counts;
-		uint32_t *tiles_touched_sums;
-		cudaMalloc(&radii_pos_counts, N * sizeof(int));
-		cudaMalloc(&tiles_touched_sums, N * sizeof(uint32_t));
-		cudaMemset(radii_pos_counts, 0, N * sizeof(int));
-		cudaMemset(tiles_touched_sums, 0, N * sizeof(uint32_t));
-		computeRadiiPosCountKernel<<<(P * N + 255) / 256, 256>>>(radii, P, N, radii_pos_counts);
-		computeTilesTouchedSumKernel<<<(P * N + 255) / 256, 256>>>(geomState.tiles_touched, P, N, tiles_touched_sums);
-		cudaDeviceSynchronize();
-		cudaMemcpy(radii_pos_counts_host, radii_pos_counts, N * sizeof(int), cudaMemcpyDeviceToHost);
-		cudaMemcpy(tiles_touched_sums_host, tiles_touched_sums, N * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-		std::cout << "[GS_BATCH_DEBUG] preprocessBatch counts: ";
-		for (int i = 0; i < N && i < 2; i++) {
-			std::cout << "cam" << i << "_radii_pos=" << radii_pos_counts_host[i] << ", cam" << i << "_tiles_touched=" << tiles_touched_sums_host[i];
-			if (i < N - 1 && i < 1) std::cout << "; ";
-		}
-		std::cout << std::endl;
-		cudaFree(radii_pos_counts);
-		cudaFree(tiles_touched_sums);
-		delete[] radii_pos_counts_host;
-		delete[] tiles_touched_sums_host;
-	}
-
-	// STAGE 2: scan
-	// Compute prefix sum over full list of touched tile counts per (camera, gaussian)
-	// This must be done BEFORE duplicateWithKeysBatch to initialize point_offsets
 	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P * N), debug)
-	if (gs_batch_profile) cudaEventRecord(profile_scan_done);
 
-	// Retrieve actual number of rendered entries
 	uint32_t num_rendered_u32;
 	CHECK_CUDA(cudaMemcpy(&num_rendered_u32, geomState.point_offsets + P * N - 1, sizeof(uint32_t), cudaMemcpyDeviceToHost), debug);
 	const uint64_t max_rendered_possible = static_cast<uint64_t>(P) * static_cast<uint64_t>(N) * static_cast<uint64_t>(tile_grid.x) * static_cast<uint64_t>(tile_grid.y);
-	if (gs_batch_debug) {
-		std::cout << "[GS_BATCH_DEBUG] num_rendered_u32=" << num_rendered_u32
-			<< ", max_rendered_possible=" << max_rendered_possible << std::endl;
-	}
 	if (num_rendered_u32 > max_rendered_possible || num_rendered_u32 > static_cast<uint32_t>(std::numeric_limits<int>::max()))
 	{
 		throw std::runtime_error("Batch rasterizer produced an invalid tile-overlap count before binning allocation.");
@@ -939,59 +769,23 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 			<< ", image=" << width << "x" << height
 			<< ", num_rendered=" << num_rendered << std::endl;
 
-	if (gs_batch_debug) {
-		auto ret = cudaDeviceSynchronize();
-		if (ret != cudaSuccess) {
-			std::cerr << "\n[GS_BATCH_DEBUG] STAGE 2 scan CUDA ERROR: " << cudaGetErrorString(ret) << std::endl;
-			throw std::runtime_error(cudaGetErrorString(ret));
-		}
-		std::cout << "[GS_BATCH_DEBUG] STAGE 2 scan PASSED, num_rendered=" << num_rendered << std::endl;
-	}
-
 	size_t num_tiles_per_cam = tile_grid.x * tile_grid.y;
 	const uint64_t total_tile_groups = static_cast<uint64_t>(N) * static_cast<uint64_t>(num_tiles_per_cam);
 	if (total_tile_groups > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()))
 	{
-		destroy_profile_events();
 		throw std::runtime_error("Batch rasterizer has too many camera/tile groups for the packed sort key.");
 	}
-	const int tile_group_bits = bitsNeeded(total_tile_groups);
-	const int sort_end_bit = std::min(64, 32 + tile_group_bits);
+	const int sort_end_bit = std::min(64, 32 + bitsNeeded(total_tile_groups));
 
 	if (num_rendered == 0)
 	{
-		if (gs_batch_debug) {
-			std::cout << "[GS_BATCH_DEBUG] no tile overlaps; skipping binning, sorting, ranges, and renderBatch" << std::endl;
-			std::cout << "[GS_BATCH_DEBUG] forwardBatch END" << std::endl;
-		}
-		if (gs_batch_profile)
-		{
-			cudaEventSynchronize(profile_scan_done);
-			std::cout << "[GS_BATCH_PROFILE] {\"P\":" << P
-				<< ",\"N\":" << N
-				<< ",\"image\":\"" << width << "x" << height << "\""
-				<< ",\"num_rendered\":0"
-				<< ",\"sort_end_bit\":" << sort_end_bit
-				<< ",\"stage_ms\":{\"preprocess\":" << elapsed_ms(profile_start, profile_preprocess_done)
-				<< ",\"scan\":" << elapsed_ms(profile_preprocess_done, profile_scan_done)
-				<< ",\"duplicate\":0,\"sort\":0,\"range\":0,\"render\":0"
-				<< ",\"gpu_total\":" << elapsed_ms(profile_start, profile_scan_done)
-				<< "}}" << std::endl;
-		}
-		destroy_profile_events();
 		return 0;
 	}
 
-	// Allocate binning state with actual num_rendered
 	size_t binning_chunk_size = required<BinningStateBatch>(num_rendered);
-	if (gs_batch_debug) {
-		std::cout << "[GS_BATCH_DEBUG] binning_chunk_size=" << binning_chunk_size << std::endl;
-	}
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningStateBatch binningState = BinningStateBatch::fromChunk(binning_chunkptr, num_rendered);
 
-	// STAGE 3: duplicateWithKeysBatch
-	// Duplicate with keys - each Gaussian per camera generates tile entries
 	CHECK_CUDA((duplicateWithKeysBatch << <(P * N + 255) / 256, 256 >> > (
 		P, N,
 		geomState.means2D,
@@ -1001,95 +795,21 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 		binningState.point_list_unsorted,
 		radii,
 		tile_grid)), debug)
-	// Each GPU thread emits all tile-overlap records for exactly one (camera, Gaussian).
 
-	if (gs_batch_debug) {
-		auto ret = cudaDeviceSynchronize();
-		if (ret != cudaSuccess) {
-			std::cerr << "\n[GS_BATCH_DEBUG] STAGE 3 duplicateWithKeysBatch CUDA ERROR: " << cudaGetErrorString(ret) << std::endl;
-			throw std::runtime_error(cudaGetErrorString(ret));
-		}
-		std::cout << "[GS_BATCH_DEBUG] STAGE 3 duplicateWithKeysBatch PASSED" << std::endl;
-	}
-	if (gs_batch_profile) cudaEventRecord(profile_duplicate_done);
-
-	// STAGE 4: sort
-	// The packed key includes camera and tile information, so a single global sort
-	// groups records by camera first, then by tile, then by depth.
-	// Sort by keys using actual num_rendered
 	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
 		binningState.list_sorting_space,
 		binningState.sorting_size,
 		binningState.point_list_keys_unsorted, binningState.point_list_keys,
 		binningState.point_list_unsorted, binningState.point_list,
 		num_rendered, 0, sort_end_bit), debug)
-	// Only sort the key bits that can vary: 32 depth bits plus enough high bits
-	// for all camera/tile groups.
-	if (gs_batch_profile) cudaEventRecord(profile_sort_done);
 
-	if (gs_batch_debug) {
-		auto ret = cudaDeviceSynchronize();
-		if (ret != cudaSuccess) {
-			std::cerr << "\n[GS_BATCH_DEBUG] STAGE 4 sort CUDA ERROR: " << cudaGetErrorString(ret) << std::endl;
-			throw std::runtime_error(cudaGetErrorString(ret));
-		}
-		std::cout << "[GS_BATCH_DEBUG] STAGE 4 sort PASSED" << std::endl;
-		
-		// Check for OOB in point_list
-		int point_list_oob = 0;
-		if (num_rendered > 0) {
-			uint32_t* point_list_host = new uint32_t[num_rendered];
-			cudaMemcpy(point_list_host, binningState.point_list, num_rendered * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-			for (int i = 0; i < num_rendered; i++) {
-				if (point_list_host[i] >= (uint32_t)P) {
-					point_list_oob++;
-				}
-			}
-			delete[] point_list_host;
-		}
-		std::cout << "[GS_BATCH_DEBUG] point_list_oob_count=" << point_list_oob << std::endl;
-	}
-
-	// STAGE 5: identifyTileRangesBatch
-	// Initialize ranges
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, N * num_tiles_per_cam * sizeof(uint2)), debug);
-	// cudaMemset writes device memory from the CPU side; here we clear the output range table.
-
-	// Identify start and end of per-(camera, tile) workloads
-	if (num_rendered > 0)
-		identifyTileRangesBatch << <(num_rendered + 255) / 256, 256 >> > (
-			num_rendered,
-			binningState.point_list_keys,
-			imgState.ranges);
+	identifyTileRangesBatch << <(num_rendered + 255) / 256, 256 >> > (
+		num_rendered,
+		binningState.point_list_keys,
+		imgState.ranges);
 	CHECK_CUDA(cudaGetLastError(), debug)
-	// imgState.ranges is indexed as [camera * tiles_per_camera + tile].
-	if (gs_batch_profile) cudaEventRecord(profile_range_done);
 
-	if (gs_batch_debug) {
-		auto ret = cudaDeviceSynchronize();
-		if (ret != cudaSuccess) {
-			std::cerr << "\n[GS_BATCH_DEBUG] STAGE 5 identifyTileRangesBatch CUDA ERROR: " << cudaGetErrorString(ret) << std::endl;
-			throw std::runtime_error(cudaGetErrorString(ret));
-		}
-		std::cout << "[GS_BATCH_DEBUG] STAGE 5 identifyTileRangesBatch PASSED" << std::endl;
-		
-		// Compute ranges valid/oob counts
-		int ranges_valid = 0, ranges_oob = 0;
-		uint2* ranges_host = new uint2[N * num_tiles_per_cam];
-		cudaMemcpy(ranges_host, imgState.ranges, N * num_tiles_per_cam * sizeof(uint2), cudaMemcpyDeviceToHost);
-		for (int i = 0; i < N * num_tiles_per_cam; i++) {
-			if (ranges_host[i].x < ranges_host[i].y) {
-				ranges_valid++;
-			} else if (ranges_host[i].x > ranges_host[i].y) {
-				ranges_oob++;
-			}
-		}
-		delete[] ranges_host;
-		std::cout << "[GS_BATCH_DEBUG] ranges_valid_count=" << ranges_valid << ", ranges_oob_count=" << ranges_oob << std::endl;
-	}
-
-	// STAGE 6: renderBatch
-	// Render all cameras
 	const float* feature_ptr = nullptr;
 	int feature_stride = -1;
 	if (render_color)
@@ -1112,89 +832,6 @@ int CudaRasterizer::Rasterizer::forwardBatch(
 		geomState.depths,
 		depth,
 		feature_stride), debug)
-	// renderBatch consumes the per-(camera, tile) ranges and writes all camera images
-	// into one flattened output buffer.
-	if (gs_batch_profile) cudaEventRecord(profile_render_done);
 
-	if (gs_batch_debug) {
-		auto ret = cudaDeviceSynchronize();
-		if (ret != cudaSuccess) {
-			std::cerr << "\n[GS_BATCH_DEBUG] STAGE 6 renderBatch CUDA ERROR: " << cudaGetErrorString(ret) << std::endl;
-			throw std::runtime_error(cudaGetErrorString(ret));
-		}
-		std::cout << "[GS_BATCH_DEBUG] STAGE 6 renderBatch PASSED" << std::endl;
-		
-		// Compute out_color nonzero counts per camera
-		int* out_color_nonzero_counts_host = new int[N]();
-		if (render_color) {
-			int *out_color_nonzero_counts;
-			cudaMalloc(&out_color_nonzero_counts, N * sizeof(int));
-			cudaMemset(out_color_nonzero_counts, 0, N * sizeof(int));
-			computeOutColorNonzeroCountKernel<<<(N * 3 * height * width + 255) / 256, 256>>>(
-				out_color, N, 3, height, width, out_color_nonzero_counts);
-			cudaDeviceSynchronize();
-			cudaMemcpy(out_color_nonzero_counts_host, out_color_nonzero_counts, N * sizeof(int), cudaMemcpyDeviceToHost);
-			cudaFree(out_color_nonzero_counts);
-		}
-		
-		// Print JSON for cam0/cam1
-		std::cout << "[GS_BATCH_DEBUG] JSON: {";
-		for (int cam_id = 0; cam_id < N && cam_id < 2; cam_id++) {
-			int radii_pos = 0;
-			uint32_t tiles_sum = 0;
-			int ranges_valid = 0, ranges_oob = 0;
-			
-			int* radii_pos_buf; uint32_t* tiles_sum_buf;
-			cudaMalloc(&radii_pos_buf, sizeof(int));
-			cudaMalloc(&tiles_sum_buf, sizeof(uint32_t));
-			cudaMemset(radii_pos_buf, 0, sizeof(int));
-			cudaMemset(tiles_sum_buf, 0, sizeof(uint32_t));
-			computeRadiiPosCountKernel<<<1, 256>>>(radii + cam_id * P, P, 1, radii_pos_buf);
-			computeTilesTouchedSumKernel<<<1, 256>>>(geomState.tiles_touched + cam_id * P, P, 1, tiles_sum_buf);
-			cudaDeviceSynchronize();
-			cudaMemcpy(&radii_pos, radii_pos_buf, sizeof(int), cudaMemcpyDeviceToHost);
-			cudaMemcpy(&tiles_sum, tiles_sum_buf, sizeof(uint32_t), cudaMemcpyDeviceToHost);
-			cudaFree(radii_pos_buf);
-			cudaFree(tiles_sum_buf);
-			
-			uint2* ranges_host = new uint2[num_tiles_per_cam];
-			cudaMemcpy(ranges_host, imgState.ranges + cam_id * num_tiles_per_cam, num_tiles_per_cam * sizeof(uint2), cudaMemcpyDeviceToHost);
-			for (int t = 0; t < num_tiles_per_cam; t++) {
-				if (ranges_host[t].x < ranges_host[t].y) ranges_valid++;
-				else if (ranges_host[t].x > ranges_host[t].y) ranges_oob++;
-			}
-			delete[] ranges_host;
-			
-			std::cout << "\"cam" << cam_id << "_radii_pos_count\":" << radii_pos
-				<< ",\"cam" << cam_id << "_tiles_touched_sum\":" << tiles_sum
-				<< ",\"cam" << cam_id << "_ranges_valid_count\":" << ranges_valid
-				<< ",\"cam" << cam_id << "_ranges_oob_count\":" << ranges_oob
-				<< ",\"cam" << cam_id << "_out_color_nonzero_count\":" << out_color_nonzero_counts_host[cam_id];
-			if (cam_id < N - 1 && cam_id < 1) std::cout << ",";
-		}
-		std::cout << ",\"num_rendered_total\":" << num_rendered << "}" << std::endl;
-		
-		delete[] out_color_nonzero_counts_host;
-		std::cout << "[GS_BATCH_DEBUG] forwardBatch END" << std::endl;
-	}
-
-	if (gs_batch_profile)
-	{
-		cudaEventSynchronize(profile_render_done);
-		std::cout << "[GS_BATCH_PROFILE] {\"P\":" << P
-			<< ",\"N\":" << N
-			<< ",\"image\":\"" << width << "x" << height << "\""
-			<< ",\"num_rendered\":" << num_rendered
-			<< ",\"sort_end_bit\":" << sort_end_bit
-			<< ",\"stage_ms\":{\"preprocess\":" << elapsed_ms(profile_start, profile_preprocess_done)
-			<< ",\"scan\":" << elapsed_ms(profile_preprocess_done, profile_scan_done)
-			<< ",\"duplicate\":" << elapsed_ms(profile_scan_done, profile_duplicate_done)
-			<< ",\"sort\":" << elapsed_ms(profile_duplicate_done, profile_sort_done)
-			<< ",\"range\":" << elapsed_ms(profile_sort_done, profile_range_done)
-			<< ",\"render\":" << elapsed_ms(profile_range_done, profile_render_done)
-			<< ",\"gpu_total\":" << elapsed_ms(profile_start, profile_render_done)
-			<< "}}" << std::endl;
-	}
-	destroy_profile_events();
 	return num_rendered;
 }
